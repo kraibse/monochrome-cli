@@ -46,8 +46,9 @@ python monochrome_cli.py -d --no-strict "artist name"
 | `--pages` | Max search pages for discography (default: 5) |
 | `-q`, `--quality` | Stream quality: `LOW`, `HIGH`, `LOSSLESS`, `HI_RES_LOSSLESS` (default: `HIGH`) |
 | `-o`, `--output` | Output directory (default: `downloads/`) |
-| `--mirrors` | Override Monochrome mirror URLs |
-| `--qobuz-mirrors` | Override Qobuz mirror URLs |
+| `--mirrors` | Additional Monochrome mirror URLs (merged with defaults) |
+| `--qobuz-mirrors` | Additional Qobuz mirror URLs (merged with defaults) |
+| `--status` | Check availability of all configured mirrors and exit |
 
 ### Examples
 
@@ -60,6 +61,9 @@ python monochrome_cli.py -o ~/Music "Daft Punk - Get Lucky"
 
 # Use custom mirrors
 python monochrome_cli.py --mirrors https://mirror1.com https://mirror2.com "search query"
+
+# Check mirror status before downloading
+python monochrome_cli.py --status
 ```
 
 ## Configuration
