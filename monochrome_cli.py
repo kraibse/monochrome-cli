@@ -141,12 +141,14 @@ def safe_snippet(text: str) -> str:
     return clean[:200]
 
 
-def sanitize_filename(name: str, max_len: int = 200) -> str:
+def sanitize_filename(name: str, max_bytes: int = 180) -> str:
     for ch in '\\/:*?"<>|':
         name = name.replace(ch, '_')
     name = name.strip()
-    if len(name) > max_len:
-        name = name[:max_len].rstrip()
+    # Truncate by byte length (UTF-8 multi-byte safety)
+    encoded = name.encode("utf-8")
+    if len(encoded) > max_bytes:
+        name = encoded[:max_bytes].decode("utf-8", errors="ignore").rstrip()
     return name
 
 
@@ -732,9 +734,25 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
 
     safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}")
     dest = output_dir / f"{safe_name}.flac"
-    if dest.exists():
-        console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
-        return False
+    try:
+        if dest.exists():
+            console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
+            return False
+    except OSError:
+        # Path too long — try progressively shorter names
+        for short_len in (120, 80, 50, 30):
+            safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}", max_bytes=short_len)
+            dest = output_dir / f"{safe_name}.flac"
+            try:
+                if dest.exists():
+                    console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
+                    return False
+                break
+            except OSError:
+                continue
+        else:
+            console.print(f"[red][skip] {track.title}: path too long[/red]")
+            return False
 
     task_id = progress.add_task(f"[cyan]{track.title}", start=True)
     try:
@@ -751,7 +769,22 @@ def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, 
     artist_dir = sanitize_filename(artist_folder) if artist_folder else sanitize_filename(album.display_artist)
     album_dir = sanitize_filename(album.title)
     out = base_dir / artist_dir / album_dir
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        # Directory path too long — try shorter names
+        for short_len in (120, 80, 50):
+            artist_dir = sanitize_filename(artist_folder, max_bytes=short_len) if artist_folder else sanitize_filename(album.display_artist, max_bytes=short_len)
+            album_dir = sanitize_filename(album.title, max_bytes=short_len)
+            out = base_dir / artist_dir / album_dir
+            try:
+                out.mkdir(parents=True, exist_ok=True)
+                break
+            except OSError:
+                continue
+        else:
+            console.print(f"[red][skip] Album path too long: {album.title}[/red]")
+            return 0
 
     console.print(Panel(
         f"[bold]{album.title}[/bold] by {album.display_artist}\n"
@@ -807,7 +840,11 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
         return 0
 
     out = output_dir / sanitize_filename(csv_path.stem)
-    out.mkdir(parents=True, exist_ok=True)
+    try:
+        out.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        out = output_dir / sanitize_filename(csv_path.stem, max_bytes=80)
+        out.mkdir(parents=True, exist_ok=True)
     console.print(f"[bold]Downloading playlist from {csv_path.name} into {out}[/bold]")
 
     rows: list[dict[str, str]] = []
