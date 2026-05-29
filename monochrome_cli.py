@@ -732,10 +732,9 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
 
     safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}")
     dest = output_dir / f"{safe_name}.flac"
-    n = 1
-    while dest.exists():
-        dest = output_dir / f"{safe_name}_{n}.flac"
-        n += 1
+    if dest.exists():
+        console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
+        return False
 
     task_id = progress.add_task(f"[cyan]{track.title}", start=True)
     try:

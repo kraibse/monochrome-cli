@@ -147,5 +147,5 @@ This overrides the config file but is overridden by the `-o` CLI flag.
 ## Notes
 
 - Downloaded files are saved as `.flac`.
-- Duplicate filenames are automatically numbered (e.g., `song_1.flac`).
+- Existing files are automatically skipped to avoid re-downloading duplicates.
 - The tool tracks mirror success rates locally in `mirror-stats.json` to improve future reliability.
