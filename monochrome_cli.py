@@ -341,11 +341,11 @@ class MonochromeClient:
                 except MirrorError as me:
                     errors.append(me.to_dict())
 
-        console.print(f"[red][monochrome] All {len(errors)} mirrors failed for {path}[/red]")
+        console.print(f"[red][monochrome] All {len(errors)} monochrome mirrors failed for {path}[/red]")
         for e in errors:
             status = f" ({e.get('status')})" if e.get("status") else ""
             console.print(f"  [red]{e['mirror']}: [{e['category']}]{status} {e['detail']}[/red]")
-        raise RuntimeError(f"All Monochrome mirrors failed for {path}")
+        raise RuntimeError(f"All {len(errors)} monochrome mirrors failed for {path}")
 
     def search(self, query: str, limit: int = 8, offset: int = 0, preferred_mirror: str | None = None) -> tuple[list[TrackMatch], str | None]:
         path = f"/search/?s={quote(query)}&limit={limit}&offset={offset}"
@@ -528,23 +528,49 @@ class MonochromeClient:
 
     def get_stream_url(self, tidal_id: int, quality: str | None = None, isrc: str | None = None) -> str:
         q = quality or self.quality
+        path = f"/track/?id={tidal_id}&quality={q}"
 
+        # Try monochrome mirrors first
+        mono_data: dict[str, Any] | None = None
+        mono_errors: int = 0
+        try:
+            mono_data, _ = self._request_any(path)
+            url = self._extract_stream_url(mono_data)
+            if url:
+                return url
+        except RuntimeError as exc:
+            # All monochrome mirrors failed; extract how many were tried
+            msg = str(exc)
+            if "mirrors failed" in msg.lower():
+                parts = msg.split()
+                for i, part in enumerate(parts):
+                    if part.isdigit() and i > 0 and parts[i - 1].lower() == "all":
+                        mono_errors = int(part)
+                        break
+
+        # Fallback to Qobuz when monochrome fails or returns no playable URL
         if isrc and self.qobuz_urls:
+            console.print(f"[yellow][fallback] Trying {len(self.qobuz_urls)} Qobuz mirror(s) for ISRC {isrc}...[/yellow]")
             qobuz_url = self._try_qobuz(isrc, q)
             if qobuz_url:
                 return qobuz_url
+            console.print(f"[red][fallback] All {len(self.qobuz_urls)} Qobuz mirror(s) failed for ISRC {isrc}[/red]")
+        elif not self.qobuz_urls:
+            console.print(f"[yellow][fallback] No Qobuz mirrors configured — skipping fallback[/yellow]")
+        elif not isrc:
+            console.print(f"[yellow][fallback] No ISRC available for track {tidal_id} — skipping Qobuz fallback[/yellow]")
 
-        path = f"/track/?id={tidal_id}&quality={q}"
-        data, _ = self._request_any(path)
-        url = self._extract_stream_url(data)
-        if url:
-            return url
+        # If monochrome succeeded but returned no stream URL, diagnose and raise
+        if mono_data is not None:
+            reason = self._classify_missing(mono_data)
+            self._log_diag(tidal_id, mono_data, path, reason)
+            exc = RuntimeError(f"No playable URL for track {tidal_id}")
+            exc.reason = reason
+            raise exc
 
-        reason = self._classify_missing(data)
-        self._log_diag(tidal_id, data, path, reason)
-        exc = RuntimeError(f"No playable URL for track {tidal_id}")
-        exc.reason = reason
-        raise exc
+        # All monochrome mirrors failed and no Qobuz fallback succeeded
+        total_tried = f"{mono_errors} monochrome + {len(self.qobuz_urls) if self.qobuz_urls else 0} Qobuz" if self.qobuz_urls else f"{mono_errors} monochrome (no Qobuz fallback)"
+        raise RuntimeError(f"All mirrors failed for {path} ({total_tried})")
 
     def _quality_to_qobuz(self, quality: str) -> str:
         q = quality.upper()
