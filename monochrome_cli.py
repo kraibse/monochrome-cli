@@ -250,9 +250,12 @@ class MonochromeClient:
         quality: str = DEFAULT_QUALITY,
         qobuz_urls: list[str] | None = None,
     ) -> None:
-        self.base_urls = [u.rstrip("/") for u in (base_urls or DEFAULT_MONOCHROME_MIRRORS)]
+        # Merge defaults with user-provided URLs; defaults first, then extras
+        mono = list(dict.fromkeys(DEFAULT_MONOCHROME_MIRRORS + (base_urls or [])))
+        self.base_urls = [u.rstrip("/") for u in mono]
         self.quality = quality
-        self.qobuz_urls = [u.rstrip("/") for u in (qobuz_urls or DEFAULT_QOBUZ_MIRRORS)]
+        qob = list(dict.fromkeys(DEFAULT_QOBUZ_MIRRORS + (qobuz_urls or [])))
+        self.qobuz_urls = [u.rstrip("/") for u in qob]
         self.stats = MirrorStats()
         self.session = requests.Session()
         self.session.headers.update({"Accept": "application/json"})
