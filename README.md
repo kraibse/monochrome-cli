@@ -84,6 +84,17 @@ The tool reads `Track Name` and `Artist Name(s)` columns, searches each track, a
 - `Track Name`
 - `Artist Name(s)`
 
+**Progress tracking:** During CSV downloads, an overall progress bar shows:
+- Processed count / total tracks
+- Downloaded, skipped, failed, and missing counts
+- Estimated time remaining
+
+**Summary:** After completion, a summary table shows:
+- Downloaded tracks
+- Skipped (already existed)
+- Failed downloads
+- Missing data (CSV rows with empty fields)
+
 Rows missing either column are skipped. If a track can't be found, it's logged and the script continues with the next row.
 
 ## Configuration
@@ -148,4 +159,5 @@ This overrides the config file but is overridden by the `-o` CLI flag.
 
 - Downloaded files are saved as `.flac`.
 - Existing files are automatically skipped to avoid re-downloading duplicates.
+- **Bulk mode summaries:** After album, discography, or CSV downloads, a summary table shows how many tracks were downloaded, skipped, or failed.
 - The tool tracks mirror success rates locally in `mirror-stats.json` to improve future reliability.

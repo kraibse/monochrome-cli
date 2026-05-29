@@ -725,19 +725,19 @@ def pick_album(albums: list[AlbumMatch]) -> AlbumMatch | None:
         console.print("[red]Invalid choice.[/red]")
 
 
-def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Path, progress: Progress) -> bool:
+def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Path, progress: Progress) -> str:
     try:
         stream_url = client.get_stream_url(track.tidal_id, quality=client.quality, isrc=track.isrc)
     except Exception as exc:
         console.print(f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
-        return False
+        return "failed"
 
     safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}")
     dest = output_dir / f"{safe_name}.flac"
     try:
         if dest.exists():
             console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
-            return False
+            return "skipped"
     except OSError:
         # Path too long — try progressively shorter names
         for short_len in (120, 80, 50, 30):
@@ -746,23 +746,23 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
             try:
                 if dest.exists():
                     console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
-                    return False
+                    return "skipped"
                 break
             except OSError:
                 continue
         else:
             console.print(f"[red][skip] {track.title}: path too long[/red]")
-            return False
+            return "failed"
 
     task_id = progress.add_task(f"[cyan]{track.title}", start=True)
     try:
         download_file(stream_url, dest, progress, task_id)
         progress.update(task_id, description=f"[green]✓ {track.title}")
-        return True
+        return "downloaded"
     except Exception as exc:
         progress.update(task_id, description=f"[red]✗ {track.title}")
         console.print(f"[red][skip] {track.title}: download failed: {exc}[/red]")
-        return False
+        return "failed"
 
 
 def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, artist_folder: str | None = None) -> int:
@@ -793,7 +793,7 @@ def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, 
         border_style="cyan",
     ))
 
-    ok = 0
+    downloaded = skipped = failed = 0
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -802,12 +802,26 @@ def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, 
         TimeRemainingColumn(),
         console=console,
     ) as progress:
-        for i, track in enumerate(album.tracks, 1):
-            if download_single(client, track, out, progress):
-                ok += 1
+        for track in album.tracks:
+            status = download_single(client, track, out, progress)
+            if status == "downloaded":
+                downloaded += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
 
-    console.print(f"[green]Finished: {ok}/{len(album.tracks)} tracks saved[/green]\n")
-    return ok
+    summary = Table(title=f"Album Summary: {album.title} ({len(album.tracks)} tracks)", show_header=True)
+    summary.add_column("Status", style="bold")
+    summary.add_column("Count", justify="right")
+    summary.add_row("[green]Downloaded[/green]", str(downloaded))
+    if skipped:
+        summary.add_row("[yellow]Skipped[/yellow]", str(skipped))
+    if failed:
+        summary.add_row("[red]Failed[/red]", str(failed))
+    console.print(summary)
+    console.print()
+    return downloaded
 
 
 def download_discography(client: MonochromeClient, albums: list[AlbumMatch], base_dir: Path, artist_query: str) -> int:
@@ -827,11 +841,12 @@ def download_discography(client: MonochromeClient, albums: list[AlbumMatch], bas
     if not Confirm.ask(f"Download all {len(albums)} album(s)?"):
         return 0
 
-    ok_total = 0
+    total_downloaded = 0
     for album in albums:
-        ok_total += download_album(client, album, base_dir, artist_folder=artist_query)
-    console.print(f"[bold green]Discography complete: {ok_total}/{total_tracks} tracks saved across {len(albums)} album(s)[/bold green]")
-    return ok_total
+        total_downloaded += download_album(client, album, base_dir, artist_folder=artist_query)
+
+    console.print(f"[bold green]Discography complete: {total_downloaded}/{total_tracks} tracks saved across {len(albums)} album(s)[/bold green]")
+    return total_downloaded
 
 
 def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path) -> int:
@@ -857,7 +872,17 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
         console.print("[yellow]CSV file is empty.[/yellow]")
         return 0
 
-    ok = 0
+    downloaded = skipped = failed = missing = 0
+    total = len(rows)
+    start = time.time()
+
+    def _overall_desc() -> str:
+        elapsed = time.time() - start
+        avg = elapsed / (downloaded + skipped + failed + missing) if (downloaded + skipped + failed + missing) > 0 else 0
+        remaining = (total - (downloaded + skipped + failed + missing)) * avg
+        eta_str = f"{remaining:.0f}s" if remaining > 0 else "0s"
+        return f"[bold cyan]Overall: {downloaded + skipped + failed + missing}/{total} | Down: {downloaded} | Skip: {skipped} | Fail: {failed} | Miss: {missing} | ETA: {eta_str}[/bold cyan]"
+
     with Progress(
         TextColumn("[progress.description]{task.description}"),
         BarColumn(),
@@ -866,31 +891,57 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
         TimeRemainingColumn(),
         console=console,
     ) as progress:
+        overall_task = progress.add_task(_overall_desc(), total=total)
         for row in rows:
             track_name = row.get("Track Name", "").strip()
             artists_raw = row.get("Artist Name(s)", "").strip()
             if not track_name or not artists_raw:
+                missing += 1
                 console.print("[yellow][skip] Missing track/artist in CSV row[/yellow]")
+                progress.update(overall_task, advance=1, description=_overall_desc())
                 continue
 
             query = f"{artists_raw} - {track_name}"
             try:
                 tracks, _ = client.search(query, limit=8)
             except Exception as exc:
+                failed += 1
                 console.print(f"[yellow][skip] Search failed for '{query}': {exc}[/yellow]")
+                progress.update(overall_task, advance=1, description=_overall_desc())
                 continue
 
             if not tracks:
+                failed += 1
                 console.print(f"[yellow][skip] No results for '{query}'[/yellow]")
+                progress.update(overall_task, advance=1, description=_overall_desc())
                 continue
 
             # Pick first result
             track = tracks[0]
-            if download_single(client, track, out, progress):
-                ok += 1
+            status = download_single(client, track, out, progress)
+            if status == "downloaded":
+                downloaded += 1
+            elif status == "skipped":
+                skipped += 1
+            else:
+                failed += 1
 
-    console.print(f"[bold green]Playlist complete: {ok}/{len(rows)} tracks saved[/bold green]")
-    return ok
+            progress.update(overall_task, advance=1, description=_overall_desc())
+
+    # Final summary
+    summary = Table(title=f"Playlist Summary: {csv_path.name}")
+    summary.add_column("Status", style="bold")
+    summary.add_column("Count", justify="right")
+    summary.add_row("[green]Downloaded[/green]", str(downloaded))
+    if skipped:
+        summary.add_row("[yellow]Skipped (already exists)[/yellow]", str(skipped))
+    if failed:
+        summary.add_row("[red]Failed[/red]", str(failed))
+    if missing:
+        summary.add_row("[dim]Missing data (CSV)[/dim]", str(missing))
+    summary.add_row("[bold]Total processed[/bold]", str(total))
+    console.print(summary)
+    return downloaded
 
 
 def _check_mirror(session: requests.Session, url: str, path: str, timeout: int = 8) -> dict[str, Any]:
@@ -1018,7 +1069,13 @@ def main() -> int:
             TimeRemainingColumn(),
             console=console,
         ) as progress:
-            download_single(client, track, out, progress)
+            status = download_single(client, track, out, progress)
+            if status == "skipped":
+                console.print("[yellow]Track already exists — skipped.[/yellow]")
+            elif status == "failed":
+                console.print("[red]Track download failed.[/red]")
+            else:
+                console.print("[green]Track downloaded successfully.[/green]")
 
     return 0
 
