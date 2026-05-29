@@ -141,10 +141,13 @@ def safe_snippet(text: str) -> str:
     return clean[:200]
 
 
-def sanitize_filename(name: str) -> str:
+def sanitize_filename(name: str, max_len: int = 200) -> str:
     for ch in '\\/:*?"<>|':
         name = name.replace(ch, '_')
-    return name.strip()
+    name = name.strip()
+    if len(name) > max_len:
+        name = name[:max_len].rstrip()
+    return name
 
 
 def normalize_artist(name: str) -> str:
