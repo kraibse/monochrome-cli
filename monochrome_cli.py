@@ -874,14 +874,9 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
 
     downloaded = skipped = failed = missing = 0
     total = len(rows)
-    start = time.time()
 
     def _overall_desc() -> str:
-        elapsed = time.time() - start
-        avg = elapsed / (downloaded + skipped + failed + missing) if (downloaded + skipped + failed + missing) > 0 else 0
-        remaining = (total - (downloaded + skipped + failed + missing)) * avg
-        eta_str = f"{remaining:.0f}s" if remaining > 0 else "0s"
-        return f"[bold cyan]Overall: {downloaded + skipped + failed + missing}/{total} | Down: {downloaded} | Skip: {skipped} | Fail: {failed} | Miss: {missing} | ETA: {eta_str}[/bold cyan]"
+        return f"[bold cyan]Overall: {downloaded + skipped + failed + missing}/{total} | Down: {downloaded} | Skip: {skipped} | Fail: {failed} | Miss: {missing}[/bold cyan]"
 
     with Progress(
         TextColumn("[progress.description]{task.description}"),
@@ -912,7 +907,7 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
 
             if not tracks:
                 failed += 1
-                console.print(f"[yellow][skip] No results for '{query}'[/yellow]")
+                console.print(f"[red][fail] No results for '{query}'[/red]")
                 progress.update(overall_task, advance=1, description=_overall_desc())
                 continue
 
