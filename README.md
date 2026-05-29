@@ -49,6 +49,7 @@ python monochrome_cli.py -d --no-strict "artist name"
 | `--mirrors` | Additional Monochrome mirror URLs (merged with defaults) |
 | `--qobuz-mirrors` | Additional Qobuz mirror URLs (merged with defaults) |
 | `--status` | Check availability of all configured mirrors and exit |
+| `--csv` | Path to a CSV playlist file for bulk download |
 
 ### Examples
 
@@ -64,7 +65,26 @@ python monochrome_cli.py --mirrors https://mirror1.com https://mirror2.com "sear
 
 # Check mirror status before downloading
 python monochrome_cli.py --status
+
+# Bulk download from a CSV playlist
+python monochrome_cli.py --csv playlist.csv
 ```
+
+### CSV Playlists
+
+You can bulk-download tracks from a CSV playlist export (e.g., from Spotify):
+
+```bash
+python monochrome_cli.py --csv my_playlist.csv
+```
+
+The tool reads `Track Name` and `Artist Name(s)` columns, searches each track, and downloads the first match. All tracks are saved into a folder named after the CSV file (without extension) inside the output directory.
+
+**Supported CSV columns:**
+- `Track Name`
+- `Artist Name(s)`
+
+Rows missing either column are skipped. If a track can't be found, it's logged and the script continues with the next row.
 
 ## Configuration
 

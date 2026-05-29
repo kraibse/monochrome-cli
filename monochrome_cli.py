@@ -6,6 +6,7 @@ Standalone script — no Discord, no player backend.
 """
 
 import argparse
+import csv
 import json
 import os
 import sys
@@ -59,7 +60,7 @@ def _load_config() -> dict[str, Any]:
 
 
 _cfg = _load_config()
-DEFAULT_OUTPUT = Path(os.environ.get("MONOCHROME_DL_OUTPUT") or _cfg.get("output_dir") or "downloads")
+DEFAULT_OUTPUT = Path(os.path.expanduser(os.environ.get("MONOCHROME_DL_OUTPUT") or _cfg.get("output_dir") or "downloads"))
 DEFAULT_CFG_MONOCHROME_MIRRORS = _cfg.get("monochrome_mirrors")
 DEFAULT_CFG_QOBUZ_MIRRORS = _cfg.get("qobuz_mirrors")
 
@@ -798,6 +799,61 @@ def download_discography(client: MonochromeClient, albums: list[AlbumMatch], bas
     return ok_total
 
 
+def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path) -> int:
+    if not csv_path.exists():
+        console.print(f"[red]CSV file not found: {csv_path}[/red]")
+        return 0
+
+    out = output_dir / sanitize_filename(csv_path.stem)
+    out.mkdir(parents=True, exist_ok=True)
+    console.print(f"[bold]Downloading playlist from {csv_path.name} into {out}[/bold]")
+
+    rows: list[dict[str, str]] = []
+    with csv_path.open(newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            rows.append(row)
+
+    if not rows:
+        console.print("[yellow]CSV file is empty.[/yellow]")
+        return 0
+
+    ok = 0
+    with Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    ) as progress:
+        for row in rows:
+            track_name = row.get("Track Name", "").strip()
+            artists_raw = row.get("Artist Name(s)", "").strip()
+            if not track_name or not artists_raw:
+                console.print("[yellow][skip] Missing track/artist in CSV row[/yellow]")
+                continue
+
+            query = f"{artists_raw} - {track_name}"
+            try:
+                tracks, _ = client.search(query, limit=8)
+            except Exception as exc:
+                console.print(f"[yellow][skip] Search failed for '{query}': {exc}[/yellow]")
+                continue
+
+            if not tracks:
+                console.print(f"[yellow][skip] No results for '{query}'[/yellow]")
+                continue
+
+            # Pick first result
+            track = tracks[0]
+            if download_single(client, track, out, progress):
+                ok += 1
+
+    console.print(f"[bold green]Playlist complete: {ok}/{len(rows)} tracks saved[/bold green]")
+    return ok
+
+
 def _check_mirror(session: requests.Session, url: str, path: str, timeout: int = 8) -> dict[str, Any]:
     full = f"{url.rstrip('/')}{path}"
     start = time.time()
@@ -831,7 +887,9 @@ def main() -> int:
     parser.add_argument("--mirrors", nargs="+", default=DEFAULT_CFG_MONOCHROME_MIRRORS, help="Monochrome mirror URLs (override config)")
     parser.add_argument("--qobuz-mirrors", nargs="+", default=DEFAULT_CFG_QOBUZ_MIRRORS, help="Qobuz mirror URLs (override config)")
     parser.add_argument("--status", action="store_true", help="Check mirror availability and exit")
+    parser.add_argument("--csv", type=Path, default=None, help="Path to a CSV playlist file for bulk download")
     args = parser.parse_args()
+    args.output = Path(os.path.expanduser(str(args.output)))
 
     client = MonochromeClient(
         base_urls=args.mirrors,
@@ -859,6 +917,10 @@ def main() -> int:
             table.add_row("Qobuz", r["url"], f"[{status_style}]{r['status']}[/{status_style}]", latency_str)
 
         console.print(table)
+        return 0
+
+    if args.csv:
+        download_from_csv(client, args.csv, args.output)
         return 0
 
     query = args.query
