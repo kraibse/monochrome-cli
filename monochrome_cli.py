@@ -128,6 +128,9 @@ def redact_url(url: str) -> str:
 
 def safe_snippet(text: str) -> str:
     import re
+    stripped = text.strip()
+    if stripped.startswith(("<!DOCTYPE", "<html", "<head", "<body", "<div", "<h1", "<p", "<script")):
+        return "[HTML response]"
     clean = re.sub(
         r'["\s]*(?:token|cookie|auth|key|secret|signature|sig)["\s]*:\s*"[^"]*"',
         '"[REDACTED]"',
@@ -287,21 +290,31 @@ class MonochromeClient:
                         detail="Token refresh failed",
                         stream_error="CREDENTIAL_EXPIRED",
                     )
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "html" in ct:
+                    detail = f"HTTP {resp.status_code} (returned HTML page)"
+                else:
+                    detail = safe_snippet(resp.text) or f"HTTP {resp.status_code}"
                 raise MirrorError(
                     mirror=redact_url(base),
                     category="http",
                     status=resp.status_code,
-                    detail=safe_snippet(resp.text) or f"HTTP {resp.status_code}",
+                    detail=detail,
                 )
 
             try:
                 data = resp.json()
             except Exception:
                 self.stats.record(base, False)
+                ct = resp.headers.get("Content-Type", "").lower()
+                if "html" in ct:
+                    detail = "invalid JSON (returned HTML page)"
+                else:
+                    detail = f"invalid JSON: {safe_snippet(resp.text)}"
                 raise MirrorError(
                     mirror=redact_url(base),
                     category="parse",
-                    detail=f"invalid JSON: {safe_snippet(resp.text)}",
+                    detail=detail,
                 )
 
             self.stats.record(base, True)
