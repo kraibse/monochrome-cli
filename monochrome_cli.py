@@ -782,6 +782,26 @@ def download_discography(client: MonochromeClient, albums: list[AlbumMatch], bas
     return ok_total
 
 
+def _check_mirror(session: requests.Session, url: str, path: str, timeout: int = 8) -> dict[str, Any]:
+    full = f"{url.rstrip('/')}{path}"
+    start = time.time()
+    try:
+        resp = session.get(full, timeout=timeout)
+        latency = (time.time() - start) * 1000
+        if resp.ok:
+            try:
+                resp.json()
+                return {"url": url, "status": "ok", "latency_ms": latency, "http_status": resp.status_code}
+            except Exception:
+                return {"url": url, "status": "unexpected content", "latency_ms": latency, "http_status": resp.status_code}
+        return {"url": url, "status": f"HTTP {resp.status_code}", "latency_ms": latency, "http_status": resp.status_code}
+    except requests.exceptions.Timeout:
+        return {"url": url, "status": "timeout", "latency_ms": None, "http_status": None}
+    except Exception as exc:
+        cat, detail = classify_error(exc)
+        return {"url": url, "status": detail, "latency_ms": None, "http_status": None}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description="Search Monochrome and download tracks, albums, or discographies.")
     parser.add_argument("query", nargs="?", help="Search query")
@@ -794,6 +814,7 @@ def main() -> int:
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT, help="Output directory (default downloads/)")
     parser.add_argument("--mirrors", nargs="+", default=DEFAULT_CFG_MONOCHROME_MIRRORS, help="Monochrome mirror URLs (override config)")
     parser.add_argument("--qobuz-mirrors", nargs="+", default=DEFAULT_CFG_QOBUZ_MIRRORS, help="Qobuz mirror URLs (override config)")
+    parser.add_argument("--status", action="store_true", help="Check mirror availability and exit")
     args = parser.parse_args()
 
     client = MonochromeClient(
@@ -801,6 +822,28 @@ def main() -> int:
         quality=args.quality,
         qobuz_urls=args.qobuz_mirrors,
     )
+
+    if args.status:
+        table = Table(title="Mirror Status")
+        table.add_column("Type", style="cyan")
+        table.add_column("Mirror", style="blue")
+        table.add_column("Status", style="green")
+        table.add_column("Latency", style="yellow", justify="right")
+
+        for url in client.base_urls:
+            r = _check_mirror(client.session, url, "/search/?s=test&limit=1")
+            status_style = "green" if r["status"] == "ok" else "red"
+            latency_str = f"{r['latency_ms']:.0f} ms" if r["latency_ms"] is not None else "—"
+            table.add_row("Monochrome", r["url"], f"[{status_style}]{r['status']}[/{status_style}]", latency_str)
+
+        for url in client.qobuz_urls:
+            r = _check_mirror(client.session, url, "/api/get-music?q=test&offset=0")
+            status_style = "green" if r["status"] == "ok" else "red"
+            latency_str = f"{r['latency_ms']:.0f} ms" if r["latency_ms"] is not None else "—"
+            table.add_row("Qobuz", r["url"], f"[{status_style}]{r['status']}[/{status_style}]", latency_str)
+
+        console.print(table)
+        return 0
 
     query = args.query
     if not query:
