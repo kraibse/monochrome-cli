@@ -5,16 +5,9 @@
 
 A standalone Python CLI for searching and downloading music from Monochrome API mirrors.
 
-
 ## Installation
 
-Requires Python 3.9+ and the following packages:
-
-```bash
-pip install requests rich
-```
-
-Or using the requirements file:
+Requires Python 3.9+.
 
 ```bash
 pip install -r requirements.txt
@@ -22,28 +15,49 @@ pip install -r requirements.txt
 
 ## Usage
 
-### Basic Commands
+### General search
+
+Download a single track matching a free-form query. Multiple results are presented for selection.
 
 ```bash
-# Search and download a single track
+# Basic search
 python monochrome_cli.py "artist - song title"
 
+# Specific quality
+python monochrome_cli.py -q LOSSLESS "Pink Floyd - Time"
+
+# Save to a custom folder
+python monochrome_cli.py -o ~/Music "Daft Punk - Get Lucky"
+
+# Use extra mirrors (merged with the configured defaults)
+python monochrome_cli.py --mirrors https://mirror1.com https://mirror2.com "search query"
+```
+
+### Album search
+
+Search for an album and download one or more matching releases. Album results are listed for selection; numbers like `1,3,5` or `1-3`, or the keyword `all`, download multiple at once. Use `0` to cancel.
+
+```bash
 # Search and download an album
 python monochrome_cli.py -a "artist - album title"
 
-# In an interactive terminal, results open a TUI picker (see below).
-# In the legacy text prompt (piped / CI / --no-tui), you can pick multiple
-# albums at once, e.g.:
+# Multi-select examples shown by the prompt:
 #   1,3,5      -> albums #1, #3, and #5
 #   1-3        -> albums #1, #2, and #3
 #   all        -> every album in the list
 #   0          -> cancel
 python monochrome_cli.py -a "artist name"
+```
 
-# Search and download a full discography
+### Discography search
+
+Download every album for an artist in one go.
+
+```bash
+# Full discography (tracks limited to the artist)
 python monochrome_cli.py -d "artist name"
 
-# Non-strict discography (includes tracks from other artists that match the query)
+# Non-strict discography: also include tracks from other artists that match
 python monochrome_cli.py -d --no-strict "artist name"
 ```
 
@@ -63,21 +77,10 @@ python monochrome_cli.py -d --no-strict "artist name"
 | `--status` | Check availability of all configured mirrors and exit |
 | `--csv` | Path to a CSV playlist file for bulk download |
 | `--fix-extensions DIR` | Walk DIR and rename files whose extension does not match their actual audio container (FLAC / M4A / MP3) |
-| `--tui` | Force the interactive TUI picker (default on a TTY) |
-| `--no-tui` | Disable the TUI picker; use the legacy text prompts (handy for piping / CI) |
 
 ### Examples
 
 ```bash
-# Download with specific quality
-python monochrome_cli.py -q LOSSLESS "Pink Floyd - Time"
-
-# Save to a specific folder
-python monochrome_cli.py -o ~/Music "Daft Punk - Get Lucky"
-
-# Use custom mirrors
-python monochrome_cli.py --mirrors https://mirror1.com https://mirror2.com "search query"
-
 # Check mirror status before downloading
 python monochrome_cli.py --status
 
@@ -137,66 +140,6 @@ python monochrome_cli.py --fix-extensions ~/Music
 
 It scans every regular file under the directory, sniffs the first 16 bytes, and renames mismatches (e.g. `Pizza Hotline - AIR.flac` → `Pizza Hotline - AIR.m4a`). It skips non-audio files, already-correctly-named files, and any case where the target path is already occupied. The exit status is 0 either way; a summary of scanned / renamed counts is printed at the end.
 
-### Live Progress UI
-
-Album, discography, and CSV downloads use a stacked live progress display that stays compact (no scrolling) and shows aggregate counters as tracks complete. The display re-renders in place via `rich.live.Live`; per-track status messages (skips, failures, stream-URL errors) are collected during the download and printed as a single notes table once the live region closes.
-
-```
-┌──────────────────────────────────────────────────────────────┐
-│  Album 2/5 — Album                                           │
-│  AIR by Pizza Hotline                                        │
-│  8 track(s) → downloads/Pizza Hotline/AIR                    │
-└──────────────────────────────────────────────────────────────┘
-
-Overall  [████████░░░░░░░░░░] 3/8   ✓3  ⊘1  ✗0
-Track   [3/8] Intravenus  [██████████] 4.2/8.2 MB  12.4 MB/s  0:00:02
-```
-
-After the download finishes:
-
-```
-┏━━━━━━━━━━━━━━━━┳━━━━━━━┓
-┃ Status         ┃ Count  ┃
-┡━━━━━━━━━━━━━━━━╇━━━━━━━┩
-│ Downloaded     │     3  │
-│ Skipped        │     1  │
-│ Failed         │     0  │
-└────────────────┴───────┘
-
-Per-track notes
-  1. [yellow][skip] Track 4: already exists[/yellow]
-  2. [red][skip] Track 5: failed to get stream URL: mirror 503[/red]
-```
-
-Discography runs each album in sequence with its own live region; the album panel header is `Album 1/5 — Album`, `Album 2/5 — Album`, etc. CSV playlists get the same layout with an extra `?{missing}` counter for rows that had no track/artist data.
-
-### TUI Picker
-
-When you run the CLI in an interactive terminal (and stdin/stdout are both TTYs), the search-result list for single-track and album modes is shown as a keyboard-driven picker. There are no numbers to type — the highlighted row is your cursor, and you can mark many rows at once.
-
-```
-┏━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━┓
-┃   ┃ Artist   ┃ Title                ┃ Album       ┃ Quality ┃
-┡━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━┩
-│[x]│ Pink Fl… │ Time                 ┃ The Dark S… ┃ LOSELES…│   <- cursor row (reverse)
-│[ ]│ Pink Fl… │ Money                ┃ The Dark S… ┃ LOSELES…│
-│[-]│ Daft Punk│ Get Lucky            ┃ Random Acc… ┃ HIGH    │   <- excluded (dim)
-└───┴──────────┴──────────────────────┴─────────────┴─────────┘
-↑/↓ move · space mark · ⌫ exclude · a all · enter confirm · q quit
-3 marked · 1 excluded · 12 total
-```
-
-| Key | Action |
-|-----|--------|
-| `↑` / `↓` | Move the cursor (clamped at the top/bottom). |
-| `Space` | Toggle "mark for download" on the cursor row. Press again to unmark. On an excluded row, the first `Space` only re-includes it. |
-| `Backspace` | Toggle "exclude" on the cursor row — visible but ignored on confirm. Press `Backspace` again to un-exclude. |
-| `a` | Toggle mark-all. Marks every non-excluded row; press again to clear. |
-| `Enter` | Confirm. If you marked rows, those are returned. If nothing is marked, the row under the cursor is used. |
-| `q` / `Esc` / `Ctrl-C` / `Ctrl-D` | Cancel. Nothing is downloaded. |
-
-The TUI is auto-detected from the TTY. Force it explicitly with `--tui`, or force the legacy prompts with `--no-tui` (recommended for pipes, CI, and any environment where stdin/stdout are not attached to a real terminal).
-
 ## Configuration
 
 Configuration is loaded from JSON files in the following priority:
@@ -254,10 +197,3 @@ This overrides the config file but is overridden by the `-o` CLI flag.
 - **Mirror Selection:** Automatically tracks mirror reliability in `mirror-stats.json` and prioritizes the most successful mirrors.
 - **Downloads:** Saves tracks as `.flac` files, organized by artist and album when downloading albums or discographies.
 - **Fallback:** If a track's ISRC is available and Monochrome fails, the tool automatically tries Qobuz mirrors as a backup source.
-
-## Notes
-
-- Downloaded files are saved as `.flac`.
-- Existing files are automatically skipped to avoid re-downloading duplicates.
-- **Bulk mode summaries:** After album, discography, or CSV downloads, a summary table shows how many tracks were downloaded, skipped, or failed.
-- The tool tracks mirror success rates locally in `mirror-stats.json` to improve future reliability.
