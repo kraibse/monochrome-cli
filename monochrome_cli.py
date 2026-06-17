@@ -1279,19 +1279,10 @@ def download_album(
         interrupted = True
         notes.append("[yellow]Interrupted by user.[/yellow]")
 
-    summary = Table(
-        title=f"Summary: [bold]{album.title}[/bold]  [dim]({total} tracks)[/dim]",
-        title_justify="left",
-        show_header=True,
-    )
-    summary.add_column("Status", style="bold")
-    summary.add_column("Count", justify="right")
-    summary.add_row("[green]Downloaded[/green]", str(downloaded))
-    if skipped:
-        summary.add_row("[yellow]Skipped[/yellow]", str(skipped))
-    if failed:
-        summary.add_row("[red]Failed[/red]", str(failed))
-    console.print(summary)
+    # Per-album summary table removed — the "Overall" and "Track" progress
+    # bars already render ✓N / ⊘N / ✗N counts for the user. Per-track
+    # diagnostic notes are still printed so the user can see *which* tracks
+    # were skipped or failed.
     _print_notes_table(notes, title="Per-track notes")
     console.print()
     return downloaded if not interrupted else downloaded
