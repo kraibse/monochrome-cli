@@ -9,12 +9,13 @@ import argparse
 import csv
 import json
 import os
+import select
 import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, TypeVar
 from urllib.parse import quote, urlsplit
 
 import requests
@@ -32,6 +33,22 @@ from rich.progress import (
 )
 from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
+from rich.text import Text
+
+# Cross-platform raw-mode keyboard input. We bind both names on every
+# platform (the unused one becomes ``None``) so later references inside the
+# picker never hit NameError when the platform-specific module is absent.
+if sys.platform == "win32":
+    try:
+        import msvcrt  # type: ignore[import-not-found]
+    except ImportError:  # pragma: no cover
+        msvcrt = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
+    tty = None  # type: ignore[assignment]
+else:
+    import termios
+    import tty
+    msvcrt = None  # type: ignore[assignment]
 
 console = Console()
 
@@ -1463,8 +1480,23 @@ def _main() -> int:
     parser.add_argument("--csv", type=Path, default=None, help="Path to a CSV playlist file for bulk download")
     parser.add_argument("--fix-extensions", type=Path, default=None, metavar="DIR",
                         help="Rename files under DIR whose extension does not match their actual audio container (FLAC/M4A/MP3) and exit")
+    parser.add_argument(
+        "--tui",
+        dest="tui",
+        action="store_true",
+        default=None,
+        help="Force the interactive TUI picker (arrow keys, space, a, backspace, q)",
+    )
+    parser.add_argument(
+        "--no-tui",
+        dest="tui",
+        action="store_false",
+        default=None,
+        help="Disable the TUI picker; use the legacy text prompts (handy for piping / CI)",
+    )
     args = parser.parse_args()
     args.output = Path(os.path.expanduser(str(args.output)))
+    tui_mode = args.tui if args.tui is not None else _is_tty()
 
     if args.fix_extensions is not None:
         root = Path(os.path.expanduser(str(args.fix_extensions)))
@@ -1535,7 +1567,7 @@ def _main() -> int:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
 
-        selected = pick_albums(albums)
+        selected = select_albums(albums, force_tui=tui_mode)
         if not selected:
             return 0
 
@@ -1572,7 +1604,8 @@ def _main() -> int:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
 
-        track = pick_track(tracks)
+        track_list = select_tracks(tracks, force_tui=tui_mode)
+        track = track_list[0] if track_list else None
         if not track:
             return 0
 
@@ -1599,6 +1632,627 @@ def _main() -> int:
             console.print("\n[yellow]Interrupted by user.[/yellow]")
 
     return 0
+
+
+# ──────────────────────────────────────────────────────────────────────────────
+# TUI picker
+#
+# Interactive selection for search results: arrow keys move a cursor, Space
+# toggles a per-row "marked for download" state, Backspace toggles a per-row
+# "excluded" state, `a` toggles mark-all, Enter confirms, `q` cancels.
+#
+# Renders inside a `rich.live.Live` so the table redraws in place. Keyboard
+# input is read directly from the terminal in cbreak mode; terminal state is
+# always restored on exit (including on KeyboardInterrupt / EOF).
+# ──────────────────────────────────────────────────────────────────────────────
+
+
+_T = TypeVar("_T")
+
+
+# Canonical key names produced by _read_one_key / _parse_key_bytes.
+KEY_UP = "UP"
+KEY_DOWN = "DOWN"
+KEY_LEFT = "LEFT"
+KEY_RIGHT = "RIGHT"
+KEY_ENTER = "ENTER"
+KEY_SPACE = "SPACE"
+KEY_BACKSPACE = "BACKSPACE"
+KEY_QUIT = "q"
+KEY_ALL = "a"
+KEY_ESC = "ESC"
+KEY_OTHER = "OTHER"
+KEY_CTRL_C = "CTRL_C"
+KEY_CTRL_D = "CTRL_D"
+KEY_HOME = "HOME"
+KEY_END = "END"
+
+# 1-byte keystrokes that map to a canonical key name.
+_SINGLE_KEY_MAP: dict[bytes, str] = {
+    b"\r": KEY_ENTER,
+    b"\n": KEY_ENTER,
+    b" ": KEY_SPACE,
+    b"\x7f": KEY_BACKSPACE,
+    b"\x08": KEY_BACKSPACE,
+    b"\x03": KEY_CTRL_C,
+    b"\x04": KEY_CTRL_D,
+    b"q": KEY_QUIT,
+    b"Q": KEY_QUIT,
+    b"a": KEY_ALL,
+    b"A": KEY_ALL,
+}
+
+# Trailing byte of an ESC [ X (or ESC O X) arrow / navigation sequence.
+_TRAILING_KEY_MAP: dict[bytes, str] = {
+    b"A": KEY_UP,
+    b"B": KEY_DOWN,
+    b"C": KEY_RIGHT,
+    b"D": KEY_LEFT,
+    b"H": KEY_HOME,
+    b"F": KEY_END,
+}
+
+# Windows arrow keys: msvcrt.getch returns b"\x00" or b"\xe0" followed by a
+# second byte that identifies the actual key.
+_WIN_SCAN_MAP: dict[bytes, str] = {
+    b"H": KEY_UP,
+    b"P": KEY_DOWN,
+    b"K": KEY_LEFT,
+    b"M": KEY_RIGHT,
+    b"G": KEY_HOME,
+    b"O": KEY_END,
+}
+
+
+def _parse_key_bytes(buf: bytes) -> str:
+    """Map a 1-byte keystroke (or 3-byte CSI sequence) to a canonical name.
+
+    Pure function — testable without a real terminal.
+    """
+    if not buf:
+        return KEY_OTHER
+    if len(buf) == 1:
+        return _SINGLE_KEY_MAP.get(buf, KEY_OTHER)
+    if len(buf) == 3 and buf[0:2] == b"\x1b[":
+        return _TRAILING_KEY_MAP.get(buf[2:3], KEY_OTHER)
+    return KEY_OTHER
+
+
+class PickerState:
+    """Pure state model for the picker. No I/O.
+
+    Each row is in one of three states: unmarked, marked (download), or
+    excluded (skip-on-confirm). The cursor highlights exactly one row.
+    """
+
+    UNMARKED = "unmarked"
+    MARKED = "marked"
+    EXCLUDED = "excluded"
+
+    def __init__(self, n: int) -> None:
+        if n < 0:
+            raise ValueError("n must be >= 0")
+        self.n = n
+        self.cursor = 0
+        self._states: list[str] = [self.UNMARKED] * n
+
+    # ── queries ──────────────────────────────────────────────────────────
+    def state_at(self, i: int) -> str:
+        return self._states[i]
+
+    def is_marked(self, i: int) -> bool:
+        return self._states[i] == self.MARKED
+
+    def is_excluded(self, i: int) -> bool:
+        return self._states[i] == self.EXCLUDED
+
+    def counts(self) -> tuple[int, int, int]:
+        m = sum(1 for s in self._states if s == self.MARKED)
+        e = sum(1 for s in self._states if s == self.EXCLUDED)
+        return m, e, self.n
+
+    # ── transitions ──────────────────────────────────────────────────────
+    def move(self, delta: int) -> None:
+        if self.n == 0:
+            return
+        self.cursor = max(0, min(self.n - 1, self.cursor + delta))
+
+    def toggle_mark(self) -> None:
+        """Toggle the mark state on the cursor row. Excluded → unmarked."""
+        if self.n == 0:
+            return
+        i = self.cursor
+        cur = self._states[i]
+        if cur == self.MARKED:
+            self._states[i] = self.UNMARKED
+        elif cur == self.EXCLUDED:
+            self._states[i] = self.UNMARKED
+        else:
+            self._states[i] = self.MARKED
+
+    def toggle_exclude(self) -> None:
+        """Toggle the exclude state on the cursor row. Excluded ⊥ marked."""
+        if self.n == 0:
+            return
+        i = self.cursor
+        if self._states[i] == self.EXCLUDED:
+            self._states[i] = self.UNMARKED
+        else:
+            self._states[i] = self.EXCLUDED
+
+    def select_all(self) -> None:
+        """Toggle mark-all. If every non-excluded row is currently marked,
+        clear them; otherwise mark them all. Excluded rows are never marked.
+        """
+        if self.n == 0:
+            return
+        non_excluded = [i for i in range(self.n) if self._states[i] != self.EXCLUDED]
+        all_marked = bool(non_excluded) and all(
+            self._states[i] == self.MARKED for i in non_excluded
+        )
+        for i in non_excluded:
+            self._states[i] = self.UNMARKED if all_marked else self.MARKED
+
+    # ── output ───────────────────────────────────────────────────────────
+    def confirmed(self) -> list[int]:
+        """Indices of marked rows, in display order."""
+        return [i for i in range(self.n) if self._states[i] == self.MARKED]
+
+
+class _TerminalRaw:
+    """Context manager that puts stdin into cbreak (Unix) or no-op (Windows,
+    msvcrt handles its own state). Always restores the prior termios state
+    on exit, even on exceptions.
+    """
+
+    def __init__(self) -> None:
+        self._is_win = sys.platform == "win32"
+        self._fd: int | None = None
+        self._old: list[Any] | None = None
+
+    def __enter__(self) -> "_TerminalRaw":
+        # Windows: msvcrt manages its own terminal state — nothing to set up
+        # here. We still attempt to verify the stdio handles are usable in
+        # ``is_real`` below.
+        if self._is_win:
+            try:
+                self._fd = sys.stdin.fileno()
+            except (AttributeError, ValueError, OSError):
+                return self
+            return self
+        # Non-Windows: enter cbreak mode. Bail out (no-op) only if the
+        # termios/tty module is genuinely missing — which on a stock Linux
+        # or macOS interpreter is impossible.
+        if termios is None or tty is None:
+            return self
+        try:
+            self._fd = sys.stdin.fileno()
+        except (AttributeError, ValueError, OSError):
+            # Not a real terminal (e.g. tests, CI, piped input).
+            return self
+        try:
+            self._old = termios.tcgetattr(self._fd)
+        except termios.error:
+            self._old = None
+            return self
+        tty.setcbreak(self._fd)
+        return self
+
+    def __exit__(self, exc_type: Any, exc: Any, tb: Any) -> None:
+        if self._is_win or self._fd is None or self._old is None:
+            return
+        try:
+            termios.tcsetattr(self._fd, termios.TCSADRAIN, self._old)
+        except termios.error:
+            pass
+
+    @property
+    def is_real(self) -> bool:
+        """True if reading from a real terminal (and a keypress will be
+        consumed from stdin). False when running under tests or pipes.
+        """
+        if self._is_win:
+            return self._fd is not None
+        return self._fd is not None and self._old is not None
+
+    def read(self) -> bytes:
+        """Read one byte from the terminal. Caller is responsible for
+        buffering ESC sequences (this returns a single byte only).
+        """
+        if self._is_win:
+            assert msvcrt is not None
+            return msvcrt.getch()
+        assert self._fd is not None
+        return os.read(self._fd, 1)
+
+
+def _read_one_key(raw: _TerminalRaw) -> str | None:
+    """Read a single key from ``raw`` and return its canonical name, or
+    ``None`` on EOF. Cross-platform; handles ESC sequences and Windows scan
+    codes.
+    """
+    try:
+        ch1 = raw.read()
+    except OSError:
+        return None
+    if not ch1:
+        return None
+
+    # Windows function / arrow keys: b"\\x00" or b"\\xe0" + scan byte.
+    if sys.platform == "win32" and ch1 in (b"\x00", b"\xe0"):
+        try:
+            ch2 = raw.read()
+        except OSError:
+            return None
+        return _WIN_SCAN_MAP.get(ch2, KEY_OTHER)
+
+    # ESC: possibly the start of a CSI sequence, possibly a bare Escape.
+    if ch1 == b"\x1b" and not sys.platform == "win32":
+        # Peek with a short timeout to disambiguate bare Escape vs sequence.
+        try:
+            rlist, _, _ = select.select([raw._fd], [], [], 0.05)  # type: ignore[arg-type]
+        except (ValueError, OSError):
+            return KEY_ESC
+        if not rlist:
+            return KEY_ESC
+        try:
+            ch2 = raw.read()
+        except OSError:
+            return KEY_ESC
+        if ch2 not in (b"[", b"O"):
+            return KEY_ESC
+        try:
+            rlist, _, _ = select.select([raw._fd], [], [], 0.05)  # type: ignore[arg-type]
+        except (ValueError, OSError):
+            return KEY_ESC
+        if not rlist:
+            return KEY_ESC
+        try:
+            ch3 = raw.read()
+        except OSError:
+            return KEY_ESC
+        return _parse_key_bytes(b"\x1b" + ch2 + ch3)
+
+    return _parse_key_bytes(ch1)
+
+
+def _is_tty() -> bool:
+    """True if both stdin and stdout are attached to a terminal."""
+    try:
+        return bool(sys.stdin.isatty() and sys.stdout.isatty())
+    except (AttributeError, ValueError):
+        return False
+
+
+# Type aliases for the picker loop.
+_RowFn = Callable[[_T], list[str]]
+_LabelFn = Callable[[int, PickerState], str]
+_KeySource = Callable[[], str | None]
+
+
+def _render_picker(
+    title: str,
+    headers: list[tuple[str, str]],
+    items: list[_T],
+    state: PickerState,
+    row_fn: _RowFn,
+    label_fn: _LabelFn,
+) -> Group:
+    """Build the rich renderable for the current picker state."""
+    table = Table(
+        title=title,
+        show_header=True,
+        header_style="bold",
+        expand=True,
+        show_lines=False,
+    )
+    table.add_column("", style="cyan", no_wrap=True, width=3)
+    for name, style in headers:
+        table.add_column(name, style=style, overflow="ellipsis")
+    if not items:
+        group = Group(
+            table,
+            Text("No results to display.", style="yellow"),
+        )
+        return group
+    for i, item in enumerate(items):
+        cells: list[Text] = []
+        if i == state.cursor:
+            row_style = "reverse"
+        elif state.is_excluded(i):
+            row_style = "dim"
+        else:
+            row_style = ""
+        cells.append(Text(label_fn(i, state), style=row_style))
+        for raw in row_fn(item):
+            cells.append(Text(str(raw), style=row_style))
+        table.add_row(*cells)
+
+    m, e, n = state.counts()
+    footer = Text.assemble(
+        (
+            "↑/↓ move · space mark · ⌫ exclude · a all · enter confirm · q quit\n",
+            "dim",
+        ),
+        (f"{m} marked · {e} excluded · {n} total", "bold"),
+    )
+    return Group(table, footer)
+
+
+def _run_picker(
+    title: str,
+    headers: list[tuple[str, str]],
+    items: list[_T],
+    row_fn: _RowFn,
+    label_fn: _LabelFn,
+    *,
+    key_source: _KeySource | None = None,
+) -> tuple[PickerState, list[int]] | None:
+    """Run the interactive picker. Returns ``(state, marked_indices)`` on
+    confirm, or ``None`` on cancel / Ctrl+C / EOF.
+
+    When ``key_source`` is provided, the real terminal is not touched and the
+    picker is driven by the supplied callable (used by tests). When it is
+    ``None``, stdin is put into cbreak mode for the duration of the loop and
+    restored before returning.
+    """
+    if not items:
+        return PickerState(0), []
+    state = PickerState(len(items))
+
+    def _render() -> Group:
+        return _render_picker(title, headers, items, state, row_fn, label_fn)
+
+    def _dispatch(key: str) -> bool:
+        """Apply ``key`` to ``state``. Returns True if the loop should exit."""
+        if key == KEY_UP:
+            state.move(-1)
+        elif key == KEY_DOWN:
+            state.move(1)
+        elif key == KEY_SPACE:
+            state.toggle_mark()
+        elif key == KEY_BACKSPACE:
+            state.toggle_exclude()
+        elif key == KEY_ALL:
+            state.select_all()
+        elif key == KEY_ENTER:
+            return True
+        elif key in (KEY_QUIT, KEY_ESC, KEY_CTRL_C, KEY_CTRL_D):
+            state._cancelled = True  # type: ignore[attr-defined]
+            return True
+        return False
+
+    if key_source is not None:
+        with Live(_render(), console=console, refresh_per_second=30, transient=True):
+            while True:
+                key = key_source()
+                if key is None:
+                    state._cancelled = True  # type: ignore[attr-defined]
+                    return None
+                if _dispatch(key):
+                    break
+        return state, _resolve_confirm(state)
+
+    with _TerminalRaw() as raw:
+        if not raw.is_real:
+            # No real terminal available; fall back to a no-op key source so
+            # the caller can decide what to do (typically: use the prompt
+            # path). Returning a "cancelled" state is the safest signal.
+            return None
+        try:
+            with Live(
+                _render(),
+                console=console,
+                refresh_per_second=30,
+                transient=True,
+                screen=False,
+            ) as live:
+                while True:
+                    key = _read_one_key(raw)
+                    if key is None:
+                        return None
+                    if _dispatch(key):
+                        break
+                    live.update(_render())
+        except KeyboardInterrupt:
+            state._cancelled = True  # type: ignore[attr-defined]
+            return None
+    return state, _resolve_confirm(state)
+
+
+def _resolve_confirm(state: PickerState) -> list[int]:
+    """Pick the indices to return on confirm. If nothing is explicitly
+    marked, fall back to the cursor row — the natural "download the one I'm
+    looking at" UX. Cancellation always wins.
+    """
+    if getattr(state, "_cancelled", False):
+        return []
+    marked = state.confirmed()
+    if marked:
+        return marked
+    if state.n == 0:
+        return []
+    return [state.cursor]
+
+
+# ── Public dispatchers ─────────────────────────────────────────────────────
+
+
+def _label_track(i: int, state: PickerState) -> str:
+    if state.is_marked(i):
+        return "[x]"
+    if state.is_excluded(i):
+        return "[-]"
+    return "[ ]"
+
+
+def _row_track(t: TrackMatch) -> list[str]:
+    return [
+        ", ".join(t.artists) or "Unknown",
+        t.title,
+        t.album,
+        t.quality,
+    ]
+
+
+def _label_album(i: int, state: PickerState) -> str:
+    if state.is_marked(i):
+        return "[x]"
+    if state.is_excluded(i):
+        return "[-]"
+    return "[ ]"
+
+
+def _row_album(a: AlbumMatch) -> list[str]:
+    return [
+        a.inferred_type,
+        a.title,
+        str(len(a.tracks)),
+        a.display_artist,
+    ]
+
+
+def select_tracks(
+    tracks: list[TrackMatch],
+    *,
+    force_tui: bool | None = None,
+) -> list[TrackMatch]:
+    """Pick tracks from the search result.
+
+    In TUI mode (default on a TTY) returns the marked tracks, or
+    ``[tracks[cursor]]`` if nothing was marked. In fallback mode uses
+    ``pick_track`` and returns a single-element list (or empty on cancel).
+
+    When ``force_tui`` is ``None`` (auto-detect) and the TUI path is
+    unavailable — e.g. the terminal is not actually a TTY at the raw-mode
+    layer even though ``isatty()`` reported one — the dispatcher transparently
+    falls back to the legacy prompt so a usable selection is always
+    presented.
+    """
+    if not tracks:
+        console.print("[yellow]No tracks found.[/yellow]")
+        return []
+    if force_tui is not False and _tui_available():
+        result = _run_picker(
+            title=f"Select tracks ({len(tracks)})",
+            headers=[
+                ("Artist", "green"),
+                ("Title", "blue"),
+                ("Album", "magenta"),
+                ("Quality", "yellow"),
+            ],
+            items=tracks,
+            row_fn=_row_track,
+            label_fn=_label_track,
+        )
+        if result is not None:
+            _state, indices = result
+            return [tracks[i] for i in indices]
+        if force_tui is True:
+            # User explicitly asked for the TUI; don't fall back.
+            return []
+        # Auto-detect: TUI was not actually usable. Fall through to the
+        # prompt path so the user still gets to pick something.
+        console.print("[dim]TUI unavailable; using text prompt.[/dim]")
+    chosen = pick_track(tracks)
+    return [chosen] if chosen is not None else []
+
+
+def select_albums(
+    albums: list[AlbumMatch],
+    *,
+    force_tui: bool | None = None,
+) -> list[AlbumMatch]:
+    """Pick albums from the search result.
+
+    In TUI mode returns all marked albums in display order (or
+    ``[albums[cursor]]`` if nothing was marked). In fallback mode uses
+    ``pick_albums`` (string parser).
+
+    Falls back to the legacy prompt if TUI was auto-detected but turned out
+    to be unavailable at the raw-mode layer (see ``select_tracks``).
+    """
+    if not albums:
+        console.print("[yellow]No albums found.[/yellow]")
+        return []
+    albums = sorted(albums, key=lambda a: len(a.tracks), reverse=True)
+    if force_tui is not False and _tui_available():
+        result = _run_picker(
+            title=f"Select albums ({len(albums)})",
+            headers=[
+                ("Type", "magenta"),
+                ("Album", "blue"),
+                ("Tracks", "yellow"),
+                ("Artist", "green"),
+            ],
+            items=albums,
+            row_fn=_row_album,
+            label_fn=_label_album,
+        )
+        if result is not None:
+            _state, indices = result
+            return [albums[i] for i in indices]
+        if force_tui is True:
+            return []
+        console.print("[dim]TUI unavailable; using text prompt.[/dim]")
+    return pick_albums(albums)
+
+
+def _tui_available() -> bool:
+    """True if a real TTY is attached AND raw-mode can be entered.
+
+    Uses the same checks as :func:`_is_tty` plus a probe of the cbreak
+    context manager so the dispatcher never silently fails in environments
+    where ``isatty()`` lies (wrapper scripts, detached tmux panes,
+    CI sandboxes, …).
+    """
+    if not _is_tty():
+        return False
+    with _TerminalRaw() as raw:
+        return raw.is_real
+
+
+# ── Test helper ────────────────────────────────────────────────────────────
+
+
+def _select_albums_with_keys(
+    albums: list[AlbumMatch],
+    keys: list[str],
+) -> list[AlbumMatch]:
+    """Drive :func:`select_albums` with a fixed key sequence. No real
+    terminal is touched. Used by the test suite.
+    """
+    if not albums:
+        return []
+    albums = sorted(albums, key=lambda a: len(a.tracks), reverse=True)
+    it = iter(keys)
+
+    def src() -> str | None:
+        try:
+            return next(it)
+        except StopIteration:
+            return None
+
+    result = _run_picker(
+        title=f"Select albums ({len(albums)})",
+        headers=[
+            ("Type", "magenta"),
+            ("Album", "blue"),
+            ("Tracks", "yellow"),
+            ("Artist", "green"),
+        ],
+        items=albums,
+        row_fn=_row_album,
+        label_fn=_label_album,
+        key_source=src,
+    )
+    if result is None:
+        return []
+    _state, indices = result
+    return [albums[i] for i in indices]
+
+
+# ──────────────────────────────────────────────────────────────────────────────
 
 
 if __name__ == "__main__":

@@ -19,14 +19,27 @@ sys.path.insert(0, str(Path(__file__).parent))
 from monochrome_cli import (
     AlbumMatch,
     EXT_FOR_FORMAT,
+    KEY_BACKSPACE,
+    KEY_DOWN,
+    KEY_ENTER,
+    KEY_ESC,
+    KEY_OTHER,
+    KEY_QUIT,
+    KEY_SPACE,
+    KEY_UP,
     MirrorError,
     MirrorStats,
     MonochromeClient,
+    PickerState,
     TrackMatch,
+    _TerminalRaw,
     _detect_format_from_bytes,
     _detect_format_from_content_type,
     _existing_audio,
     _parse_album_selection,
+    _parse_key_bytes,
+    _read_one_key,
+    _select_albums_with_keys,
     artist_matches,
     classify_error,
     download_file,
@@ -37,6 +50,8 @@ from monochrome_cli import (
     redact_url,
     safe_snippet,
     sanitize_filename,
+    select_albums,
+    select_tracks,
 )
 
 
@@ -1254,6 +1269,413 @@ class TestFallbackIntegration:
                 client.get_stream_url(123, quality="HIGH", isrc="USABC1234567")
             error_msg = str(exc_info.value).lower()
             assert "no qobuz fallback" in error_msg
+
+
+# ─── TUI picker tests ───
+
+
+class TestParseKeyBytes:
+    """The byte→name normaliser is pure and must be exhaustively tested."""
+
+    def test_arrows(self):
+        assert _parse_key_bytes(b"\x1b[A") == KEY_UP
+        assert _parse_key_bytes(b"\x1b[B") == KEY_DOWN
+
+    def test_space_and_enter(self):
+        assert _parse_key_bytes(b" ") == KEY_SPACE
+        assert _parse_key_bytes(b"\r") == KEY_ENTER
+        assert _parse_key_bytes(b"\n") == KEY_ENTER
+
+    def test_backspace(self):
+        assert _parse_key_bytes(b"\x7f") == KEY_BACKSPACE
+        assert _parse_key_bytes(b"\x08") == KEY_BACKSPACE
+
+    def test_q_lowercase_and_uppercase(self):
+        assert _parse_key_bytes(b"q") == KEY_QUIT
+        assert _parse_key_bytes(b"Q") == KEY_QUIT
+
+    def test_a_lowercase_and_uppercase(self):
+        # Used for "select all"; same name as a literal.
+        assert _parse_key_bytes(b"a") == "a"
+        assert _parse_key_bytes(b"A") == "a"
+
+    def test_empty_and_unknown(self):
+        assert _parse_key_bytes(b"") == "OTHER"
+        assert _parse_key_bytes(b"x") == "OTHER"
+        assert _parse_key_bytes(b"z") == "OTHER"
+
+    def test_garbage_escape_returns_other(self):
+        # Lone ESC byte is handled by _read_one_key, not here; a 2-byte
+        # buffer that doesn't look like a sequence is "OTHER".
+        assert _parse_key_bytes(b"\x1b[") == "OTHER"
+
+    def test_known_terminator_bytes(self):
+        assert _parse_key_bytes(b"\x03") == "CTRL_C"
+        assert _parse_key_bytes(b"\x04") == "CTRL_D"
+
+    def test_three_byte_sequences_have_correct_shape(self):
+        """Regression: ESC [ A (up arrow) is 3 bytes; ESC [ [ A (4 bytes) is
+        malformed and must NOT be returned as KEY_UP."""
+        assert _parse_key_bytes(b"\x1b" + b"[" + b"A") == KEY_UP
+        assert _parse_key_bytes(b"\x1b" + b"[" + b"B") == KEY_DOWN
+        assert _parse_key_bytes(b"\x1b[A") == KEY_UP
+        assert _parse_key_bytes(b"\x1b[[A") == KEY_OTHER  # malformed
+
+
+class TestReadOneKey:
+    """_read_one_key reads raw bytes from a _TerminalRaw. The interesting
+    cases are the multi-byte ESC sequences — those previously failed when
+    the buffer was concatenated incorrectly.
+    """
+
+    class _FakeRaw:
+        def __init__(self, fd_marker: int = 7) -> None:
+            self._fd = fd_marker
+            self._buf = bytearray()
+            self._is_win = False
+
+        def feed(self, data: bytes) -> None:
+            self._buf.extend(data)
+
+        def read(self) -> bytes:
+            if not self._buf:
+                raise OSError("no data")
+            return bytes([self._buf.pop(0)])
+
+    def test_arrow_up_three_byte_sequence(self):
+        raw = self._FakeRaw()
+        raw.feed(b"\x1b[A")
+        with patch("monochrome_cli.select.select", return_value=([raw._fd], [], [])):
+            assert _read_one_key(raw) == KEY_UP
+
+    def test_arrow_down_three_byte_sequence(self):
+        raw = self._FakeRaw()
+        raw.feed(b"\x1b[B")
+        with patch("monochrome_cli.select.select", return_value=([raw._fd], [], [])):
+            assert _read_one_key(raw) == KEY_DOWN
+
+    def test_bare_escape_returns_esc(self):
+        raw = self._FakeRaw()
+        raw.feed(b"\x1b")
+        with patch("monochrome_cli.select.select", return_value=([], [], [])):
+            assert _read_one_key(raw) == KEY_ESC
+
+    def test_lone_space_returns_space(self):
+        raw = self._FakeRaw()
+        raw.feed(b" ")
+        assert _read_one_key(raw) == KEY_SPACE
+
+
+class TestPickerState:
+    """Pure state model. No I/O — every transition is just a method call."""
+
+    def test_empty_state(self):
+        st = PickerState(0)
+        assert st.counts() == (0, 0, 0)
+        assert st.confirmed() == []
+        st.move(1)  # must be a no-op, not raise
+        assert st.cursor == 0
+
+    def test_initial_all_unmarked(self):
+        st = PickerState(3)
+        assert all(st.state_at(i) == "unmarked" for i in range(3))
+        assert st.counts() == (0, 0, 3)
+
+    def test_move_clamps_to_bounds(self):
+        st = PickerState(3)
+        st.move(-1)
+        assert st.cursor == 0
+        st.move(2)
+        assert st.cursor == 2
+        st.move(1)
+        assert st.cursor == 2  # clamped at n - 1
+        st.move(-5)
+        assert st.cursor == 0  # clamped at 0
+
+    def test_toggle_mark_cycle(self):
+        st = PickerState(1)
+        st.toggle_mark()
+        assert st.is_marked(0)
+        st.toggle_mark()
+        assert st.state_at(0) == "unmarked"
+        st.toggle_mark()
+        assert st.is_marked(0)
+
+    def test_excluding_an_unmarked_row(self):
+        st = PickerState(1)
+        st.toggle_exclude()
+        assert st.is_excluded(0)
+        assert not st.is_marked(0)
+
+    def test_excluding_a_marked_row_unmarks_first(self):
+        st = PickerState(1)
+        st.toggle_mark()
+        st.toggle_exclude()
+        # exclude and mark are mutually exclusive; exclude wins and clears mark
+        assert st.is_excluded(0)
+        assert not st.is_marked(0)
+
+    def test_toggling_mark_on_excluded_clears_exclude(self):
+        st = PickerState(1)
+        st.toggle_exclude()
+        assert st.is_excluded(0)
+        st.toggle_mark()
+        # Marking an excluded row only clears the exclude — it does not also
+        # mark the row. (User must press Space twice to go from "excluded" to
+        # "marked".)
+        assert not st.is_excluded(0)
+        assert not st.is_marked(0)
+        st.toggle_mark()
+        assert st.is_marked(0)
+
+    def test_un_exclude(self):
+        st = PickerState(1)
+        st.toggle_exclude()
+        st.toggle_exclude()
+        assert st.state_at(0) == "unmarked"
+
+    def test_select_all_marks_everything(self):
+        st = PickerState(4)
+        st.select_all()
+        assert st.counts() == (4, 0, 4)
+        assert st.confirmed() == [0, 1, 2, 3]
+
+    def test_select_all_again_unmarks(self):
+        st = PickerState(3)
+        st.select_all()
+        st.select_all()
+        assert st.counts() == (0, 0, 3)
+
+    def test_select_all_preserves_excluded(self):
+        st = PickerState(3)
+        st.toggle_exclude()  # cursor at 0
+        st.move(1)
+        st.select_all()  # 0 excluded, 1 and 2 marked
+        assert st.is_excluded(0)
+        assert st.is_marked(1)
+        assert st.is_marked(2)
+
+    def test_select_all_with_everything_already_marked_unmarks_all(self):
+        st = PickerState(3)
+        # Mark each row explicitly by walking the cursor.
+        st.toggle_mark()
+        st.move(1)
+        st.toggle_mark()
+        st.move(1)
+        st.toggle_mark()
+        assert st.counts() == (3, 0, 3)
+        # all marked; toggle should clear them
+        st.select_all()
+        assert st.counts() == (0, 0, 3)
+
+    def test_confirmed_returns_only_marked(self):
+        st = PickerState(4)
+        st.move(1)
+        st.toggle_mark()
+        st.move(1)
+        st.toggle_exclude()
+        st.move(1)
+        st.toggle_mark()
+        # marked: indices 1 and 3 (in display order)
+        assert st.confirmed() == [1, 3]
+
+    def test_cursor_does_not_persist_marks(self):
+        st = PickerState(3)
+        st.move(2)
+        st.toggle_mark()
+        st.move(0)
+        assert st.is_marked(2)
+        assert not st.is_marked(0)
+
+
+def _make_albums_for_tui(n: int) -> list[AlbumMatch]:
+    """Albums with varying track counts so the order test is meaningful."""
+    out: list[AlbumMatch] = []
+    for i in range(n):
+        tracks = [
+            TrackMatch(
+                tidal_id=j,
+                title=f"Track {j}",
+                artists=[f"Artist {i}"],
+                album=f"Album {i}",
+                duration_sec=180,
+                quality="LOSELESS",
+            )
+            for j in range(i + 1)
+        ]
+        out.append(
+            AlbumMatch(
+                title=f"Album {i}",
+                artists=[f"Artist {i}"],
+                tracks=tracks,
+            )
+        )
+    return out
+
+
+class TestSelectAlbumsWithKeys:
+    """Drive the picker with a synthetic key sequence. No real terminal."""
+
+    def test_cursor_fallback_on_plain_enter(self):
+        albums = _make_albums_for_tui(3)
+        # Move down twice then confirm without marking anything. Albums are
+        # sorted by track count desc, so display order is
+        # [Album 2 (3), Album 1 (2), Album 0 (1)].
+        result = _select_albums_with_keys(albums, [KEY_DOWN, KEY_DOWN, KEY_ENTER])
+        assert [a.title for a in result] == ["Album 0"]
+
+    def test_space_marks_and_enter_returns_marked(self):
+        albums = _make_albums_for_tui(3)
+        # sorted: [2, 1, 0]  (track counts 3, 2, 1)
+        # Mark the first row, confirm.
+        result = _select_albums_with_keys(albums, [KEY_SPACE, KEY_ENTER])
+        assert [a.title for a in result] == ["Album 2"]
+
+    def test_multi_select_with_arrows(self):
+        albums = _make_albums_for_tui(3)
+        # sorted: [2, 1, 0]
+        # mark cursor, down, mark, confirm → [2, 1]
+        result = _select_albums_with_keys(
+            albums,
+            [KEY_SPACE, KEY_DOWN, KEY_SPACE, KEY_ENTER],
+        )
+        assert [a.title for a in result] == ["Album 2", "Album 1"]
+
+    def test_select_all_marks_everything(self):
+        albums = _make_albums_for_tui(3)
+        result = _select_albums_with_keys(albums, ["a", KEY_ENTER])
+        assert [a.title for a in result] == ["Album 2", "Album 1", "Album 0"]
+
+    def test_exclude_keeps_row_visible_but_skipped(self):
+        albums = _make_albums_for_tui(3)
+        # sorted: [2, 1, 0]. Mark all, then go back to row 1 (Album 2) and
+        # exclude it — should drop from confirmed output.
+        result = _select_albums_with_keys(
+            albums,
+            ["a", KEY_BACKSPACE, KEY_ENTER],
+        )
+        assert [a.title for a in result] == ["Album 1", "Album 0"]
+
+    def test_q_cancels(self):
+        albums = _make_albums_for_tui(2)
+        result = _select_albums_with_keys(albums, [KEY_SPACE, KEY_QUIT])
+        assert result == []
+
+    def test_esc_cancels(self):
+        albums = _make_albums_for_tui(2)
+        result = _select_albums_with_keys(albums, [KEY_ESC])
+        assert result == []
+
+    def test_empty_albums_returns_empty(self):
+        assert _select_albums_with_keys([], [KEY_ENTER]) == []
+
+
+def _make_tracks_for_tui(n: int) -> list[TrackMatch]:
+    return [
+        TrackMatch(
+            tidal_id=i,
+            title=f"Title {i}",
+            artists=[f"Artist {i}"],
+            album=f"Album {i}",
+            duration_sec=180,
+            quality="LOSELESS",
+        )
+        for i in range(n)
+    ]
+
+
+class TestSelectTracksWithKeys:
+    """Tracks are picked from a sorted list; the cursor fallback applies the
+    same way."""
+
+    def test_plain_enter_returns_cursor_row(self):
+        tracks = _make_tracks_for_tui(3)
+        result = select_tracks.__wrapped__ if hasattr(select_tracks, "__wrapped__") else None  # noqa: E501
+        # Use the public dispatcher with key_source via a small helper:
+        from monochrome_cli import _run_picker, _label_track, _row_track  # noqa: E401, F401
+
+        it = iter([KEY_DOWN, KEY_ENTER])
+
+        def src():
+            try:
+                return next(it)
+            except StopIteration:
+                return None
+
+        outcome = _run_picker(
+            title="t",
+            headers=[("Artist", "g"), ("Title", "b"), ("Album", "m"), ("Quality", "y")],
+            items=tracks,
+            row_fn=_row_track,
+            label_fn=_label_track,
+            key_source=src,
+        )
+        assert outcome is not None
+        _state, indices = outcome
+        assert [tracks[i].title for i in indices] == ["Title 1"]
+
+
+class TestSelectFallback:
+    """The public dispatchers must fall back to the legacy prompt when not
+    on a TTY (or when --no-tui is passed via force_tui=False).
+    """
+
+    def test_select_albums_falls_back_to_prompt(self):
+        albums = _make_albums_for_tui(3)
+        with patch("monochrome_cli._is_tty", return_value=False), \
+             patch("monochrome_cli.Prompt.ask", return_value="2") as mock_prompt:
+            result = select_albums(albums)
+        assert [a.title for a in result] == ["Album 1"]
+        mock_prompt.assert_called()
+
+    def test_select_tracks_falls_back_to_int_prompt(self):
+        tracks = _make_tracks_for_tui(2)
+        with patch("monochrome_cli._is_tty", return_value=False), \
+             patch("monochrome_cli.IntPrompt.ask", return_value=1) as mock_prompt:
+            result = select_tracks(tracks)
+        assert [t.title for t in result] == ["Title 0"]
+        mock_prompt.assert_called()
+
+    def test_select_albums_explicit_no_tui(self):
+        albums = _make_albums_for_tui(3)
+        with patch("monochrome_cli.Prompt.ask", return_value="all") as mock_prompt:
+            result = select_albums(albums, force_tui=False)
+        mock_prompt.assert_called()
+        assert len(result) == 3
+
+    def test_select_tracks_explicit_no_tui(self):
+        tracks = _make_tracks_for_tui(2)
+        with patch("monochrome_cli.IntPrompt.ask", return_value=0):
+            result = select_tracks(tracks, force_tui=False)
+        assert result == []
+
+    def test_select_albums_falls_back_when_tui_unavailable(self):
+        """When the dispatcher auto-detects TUI but the raw-mode layer
+        reports no real terminal, it must transparently fall through to the
+        prompt so a usable selection is always offered."""
+        albums = _make_albums_for_tui(3)
+        with patch("monochrome_cli._tui_available", return_value=False), \
+             patch("monochrome_cli.Prompt.ask", return_value="2") as mock_prompt:
+            result = select_albums(albums)  # force_tui=None → auto
+        assert [a.title for a in result] == ["Album 1"]
+        mock_prompt.assert_called()
+
+    def test_select_tracks_falls_back_when_tui_unavailable(self):
+        tracks = _make_tracks_for_tui(2)
+        with patch("monochrome_cli._tui_available", return_value=False), \
+             patch("monochrome_cli.IntPrompt.ask", return_value=2):
+            result = select_tracks(tracks)  # force_tui=None → auto
+        assert [t.title for t in result] == ["Title 1"]
+
+    def test_explicit_tui_falls_back_with_notice(self):
+        """If the user passes --tui but the TUI is unavailable, the
+        dispatcher should warn and fall back to the prompt so the user can
+        still get a selection — failing silently would be worse."""
+        tracks = _make_tracks_for_tui(2)
+        with patch("monochrome_cli._tui_available", return_value=False), \
+             patch("monochrome_cli.IntPrompt.ask", return_value=1):
+            result = select_tracks(tracks, force_tui=True)
+        assert [t.title for t in result] == ["Title 0"]
 
 
 # ─── Run if executed directly ───

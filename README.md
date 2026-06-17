@@ -31,7 +31,9 @@ python monochrome_cli.py "artist - song title"
 # Search and download an album
 python monochrome_cli.py -a "artist - album title"
 
-# When prompted, you can pick multiple albums at once, e.g.:
+# In an interactive terminal, results open a TUI picker (see below).
+# In the legacy text prompt (piped / CI / --no-tui), you can pick multiple
+# albums at once, e.g.:
 #   1,3,5      -> albums #1, #3, and #5
 #   1-3        -> albums #1, #2, and #3
 #   all        -> every album in the list
@@ -61,6 +63,8 @@ python monochrome_cli.py -d --no-strict "artist name"
 | `--status` | Check availability of all configured mirrors and exit |
 | `--csv` | Path to a CSV playlist file for bulk download |
 | `--fix-extensions DIR` | Walk DIR and rename files whose extension does not match their actual audio container (FLAC / M4A / MP3) |
+| `--tui` | Force the interactive TUI picker (default on a TTY) |
+| `--no-tui` | Disable the TUI picker; use the legacy text prompts (handy for piping / CI) |
 
 ### Examples
 
@@ -165,6 +169,33 @@ Per-track notes
 ```
 
 Discography runs each album in sequence with its own live region; the album panel header is `Album 1/5 — Album`, `Album 2/5 — Album`, etc. CSV playlists get the same layout with an extra `?{missing}` counter for rows that had no track/artist data.
+
+### TUI Picker
+
+When you run the CLI in an interactive terminal (and stdin/stdout are both TTYs), the search-result list for single-track and album modes is shown as a keyboard-driven picker. There are no numbers to type — the highlighted row is your cursor, and you can mark many rows at once.
+
+```
+┏━━━┳━━━━━━━━━━┳━━━━━━━━━━━━━━━━━━━━━━┳━━━━━━━━━━━━━┳━━━━━━━━━┓
+┃   ┃ Artist   ┃ Title                ┃ Album       ┃ Quality ┃
+┡━━━╇━━━━━━━━━━╇━━━━━━━━━━━━━━━━━━━━━━╇━━━━━━━━━━━━━╇━━━━━━━━━┩
+│[x]│ Pink Fl… │ Time                 ┃ The Dark S… ┃ LOSELES…│   <- cursor row (reverse)
+│[ ]│ Pink Fl… │ Money                ┃ The Dark S… ┃ LOSELES…│
+│[-]│ Daft Punk│ Get Lucky            ┃ Random Acc… ┃ HIGH    │   <- excluded (dim)
+└───┴──────────┴──────────────────────┴─────────────┴─────────┘
+↑/↓ move · space mark · ⌫ exclude · a all · enter confirm · q quit
+3 marked · 1 excluded · 12 total
+```
+
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Move the cursor (clamped at the top/bottom). |
+| `Space` | Toggle "mark for download" on the cursor row. Press again to unmark. On an excluded row, the first `Space` only re-includes it. |
+| `Backspace` | Toggle "exclude" on the cursor row — visible but ignored on confirm. Press `Backspace` again to un-exclude. |
+| `a` | Toggle mark-all. Marks every non-excluded row; press again to clear. |
+| `Enter` | Confirm. If you marked rows, those are returned. If nothing is marked, the row under the cursor is used. |
+| `q` / `Esc` / `Ctrl-C` / `Ctrl-D` | Cancel. Nothing is downloaded. |
+
+The TUI is auto-detected from the TTY. Force it explicitly with `--tui`, or force the legacy prompts with `--no-tui` (recommended for pipes, CI, and any environment where stdin/stdout are not attached to a real terminal).
 
 ## Configuration
 
