@@ -83,6 +83,26 @@ DEFAULT_OUTPUT = Path(os.path.expanduser(os.environ.get("MONOCHROME_DL_OUTPUT") 
 DEFAULT_CFG_MONOCHROME_MIRRORS = _cfg.get("monochrome_mirrors")
 DEFAULT_CFG_QOBUZ_MIRRORS = _cfg.get("qobuz_mirrors")
 
+# Quality resolution order: -q CLI flag > MONOCHROME_DL_QUALITY env >
+# config.json "quality" key > "HIGH".
+VALID_QUALITIES = ("LOW", "HIGH", "LOSSLESS", "HI_RES_LOSSLESS")
+
+
+def _resolve_default_quality() -> str:
+    """Pick the default stream quality from env, config, or built-in."""
+    raw = os.environ.get("MONOCHROME_DL_QUALITY") or _cfg.get("quality") or "HIGH"
+    raw = str(raw).upper().strip()
+    if raw not in VALID_QUALITIES:
+        console.print(
+            f"[yellow]Unknown quality {raw!r}; falling back to HIGH. "
+            f"Valid values: {', '.join(VALID_QUALITIES)}[/yellow]"
+        )
+        return "HIGH"
+    return raw
+
+
+DEFAULT_CFG_QUALITY = _resolve_default_quality()
+
 
 class MirrorStats:
     def __init__(self, path: Path = STATS_PATH) -> None:
@@ -266,6 +286,28 @@ class AlbumMatch:
         if "ep" in t.split():
             return "EP"
         return "Album"
+
+    @property
+    def quality(self) -> str:
+        """Best (highest) quality available across the album's tracks.
+
+        Returns ``"—"`` if the album has no tracks or none carry a quality
+        tag. Quality ordering: ``LOW < HIGH < LOSSLESS < HI_RES_LOSSLESS``.
+        """
+        if not self.tracks:
+            return "—"
+        rank = {"LOW": 0, "HIGH": 1, "LOSSLESS": 2, "HI_RES_LOSSLESS": 3}
+        best = -1
+        result = "—"
+        for t in self.tracks:
+            q = t.quality
+            if not q:
+                continue
+            r = rank.get(q.upper(), -1)
+            if r > best:
+                best = r
+                result = q
+        return result
 
     def __repr__(self) -> str:
         return f"[{self.inferred_type}] {self.display_artist} — {self.title} ({len(self.tracks)} tracks)"
@@ -1009,8 +1051,16 @@ def pick_albums(albums: list[AlbumMatch]) -> list[AlbumMatch]:
     table.add_column("Album", style="blue")
     table.add_column("Tracks", style="yellow")
     table.add_column("Artist", style="green")
+    table.add_column("Quality", style="cyan", no_wrap=True)
     for i, a in enumerate(albums, 1):
-        table.add_row(str(i), a.inferred_type, a.title, str(len(a.tracks)), a.display_artist)
+        table.add_row(
+            str(i),
+            a.inferred_type,
+            a.title,
+            str(len(a.tracks)),
+            a.display_artist,
+            a.quality,
+        )
     console.print(table)
 
     help_text = (
@@ -1247,38 +1297,81 @@ def download_album(
     return downloaded if not interrupted else downloaded
 
 
-def download_discography(client: MonochromeClient, albums: list[AlbumMatch], base_dir: Path, artist_query: str) -> int:
-    albums = sorted(albums, key=lambda a: len(a.tracks), reverse=True)
-    total_tracks = sum(len(a.tracks) for a in albums)
+def download_albums(
+    client: MonochromeClient,
+    selected: list[AlbumMatch],
+    base_dir: Path,
+    *,
+    artist_folder: str | None = None,
+    summary_title: str = "Multi-Album Summary",
+) -> int:
+    """Download a sequence of pre-selected albums in order with a final
+    summary table. Single-album selections skip the summary and use the
+    regular per-album progress display.
 
-    table = Table(title=f"Discography for {artist_query}")
-    table.add_column("#", style="cyan", no_wrap=True)
-    table.add_column("Type", style="magenta")
-    table.add_column("Album", style="blue")
-    table.add_column("Tracks", style="yellow")
-    table.add_column("Artist", style="green")
-    for i, a in enumerate(albums, 1):
-        table.add_row(str(i), a.inferred_type, a.title, str(len(a.tracks)), a.display_artist)
-    console.print(table)
-
-    if not Confirm.ask(f"Download all {len(albums)} album(s)?"):
+    Returns the number of tracks successfully downloaded.
+    """
+    if not selected:
         return 0
-
+    if len(selected) == 1:
+        return download_album(
+            client,
+            selected[0],
+            base_dir,
+            artist_folder=artist_folder,
+            album_index=(1, 1),
+        )
     total_downloaded = 0
+    total_tracks = sum(len(a.tracks) for a in selected)
     try:
-        for i, album in enumerate(albums, 1):
+        for i, album in enumerate(selected, 1):
             total_downloaded += download_album(
                 client,
                 album,
                 base_dir,
-                artist_folder=artist_query,
-                album_index=(i, len(albums)),
+                artist_folder=artist_folder,
+                album_index=(i, len(selected)),
             )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
 
-    console.print(f"[bold green]Discography complete: {total_downloaded}/{total_tracks} tracks saved across {len(albums)} album(s)[/bold green]")
+    summary = Table(
+        title=f"{summary_title}: {len(selected)} album(s) selected",
+        show_header=True,
+    )
+    summary.add_column("Status", style="bold")
+    summary.add_column("Count", justify="right")
+    summary.add_row(
+        f"[green]Downloaded[/green] ({len(selected)} albums, {total_tracks} tracks)",
+        str(total_downloaded),
+    )
+    console.print(summary)
+    console.print()
     return total_downloaded
+
+
+def download_discography(
+    client: MonochromeClient,
+    albums: list[AlbumMatch],
+    base_dir: Path,
+    artist_query: str,
+    *,
+    force_tui: bool | None = None,
+) -> int:
+    """Run a discography search result through the album picker (TUI by
+    default) and download the selection. Returns 0 on empty / cancelled
+    selection; otherwise the number of tracks downloaded.
+    """
+    selected = select_albums(albums, force_tui=force_tui)
+    if not selected:
+        return 0
+    return download_albums(
+        client,
+        selected,
+        base_dir,
+        artist_folder=artist_query,
+        summary_title="Discography Summary",
+    )
 
 
 def _format_csv_counters(downloaded: int, skipped: int, failed: int, missing: int) -> str:
@@ -1472,7 +1565,16 @@ def _main() -> int:
     parser.add_argument("--no-strict", action="store_true", help="In discography mode, include tracks from other artists that match the search query")
     parser.add_argument("-n", "--limit", type=int, default=50, help="Tracks per search page (default 50)")
     parser.add_argument("--pages", type=int, default=5, help="Max search pages for discography (default 5)")
-    parser.add_argument("-q", "--quality", default=DEFAULT_QUALITY, help="Stream quality (default HIGH)")
+    parser.add_argument(
+        "-q", "--quality",
+        default=DEFAULT_CFG_QUALITY,
+        choices=VALID_QUALITIES,
+        help=(
+            f"Stream quality (one of {', '.join(VALID_QUALITIES)}). "
+            f"Default: {DEFAULT_CFG_QUALITY} "
+            f"(overridable via MONOCHROME_DL_QUALITY env or config.json `quality` key)."
+        ),
+    )
     parser.add_argument("-o", "--output", type=Path, default=DEFAULT_OUTPUT, help="Output directory (default downloads/)")
     parser.add_argument("--mirrors", nargs="+", default=DEFAULT_CFG_MONOCHROME_MIRRORS, help="Monochrome mirror URLs (override config)")
     parser.add_argument("--qobuz-mirrors", nargs="+", default=DEFAULT_CFG_QOBUZ_MIRRORS, help="Qobuz mirror URLs (override config)")
@@ -1558,7 +1660,7 @@ def _main() -> int:
             console.print("[yellow]No albums found for that artist.[/yellow]")
             return 0
 
-        download_discography(client, albums, args.output, query)
+        download_discography(client, albums, args.output, query, force_tui=tui_mode)
     elif args.album:
         console.print(f"[bold]Searching albums for: {query}[/bold]")
         try:
@@ -1570,32 +1672,7 @@ def _main() -> int:
         selected = select_albums(albums, force_tui=tui_mode)
         if not selected:
             return 0
-
-        if len(selected) == 1:
-            download_album(client, selected[0], args.output, album_index=(1, 1))
-        else:
-            total_downloaded = 0
-            total_tracks = sum(len(a.tracks) for a in selected)
-            try:
-                for i, album in enumerate(selected, 1):
-                    total_downloaded += download_album(
-                        client, album, args.output, album_index=(i, len(selected))
-                    )
-            except KeyboardInterrupt:
-                console.print("\n[yellow]Interrupted by user.[/yellow]")
-
-            summary = Table(
-                title=f"Multi-Album Summary: {len(selected)} album(s) selected",
-                show_header=True,
-            )
-            summary.add_column("Status", style="bold")
-            summary.add_column("Count", justify="right")
-            summary.add_row(
-                f"[green]Downloaded[/green] ({len(selected)} albums, {total_tracks} tracks)",
-                str(total_downloaded),
-            )
-            console.print(summary)
-            console.print()
+        download_albums(client, selected, args.output)
     else:
         console.print(f"[bold]Searching tracks for: {query}[/bold]")
         try:
@@ -2023,7 +2100,18 @@ def _run_picker(
         return False
 
     if key_source is not None:
-        with Live(_render(), console=console, refresh_per_second=30, transient=True):
+        # ``screen=True`` puts the picker in the terminal's alternate screen
+        # buffer so the table is rendered into a private area. On close the
+        # alt-screen is torn down and the main screen — with any preceding
+        # output like the "Searching …" line — reappears underneath the
+        # download progress, with no visible erase/flicker.
+        with Live(
+            _render(),
+            console=console,
+            refresh_per_second=12,
+            transient=False,
+            screen=True,
+        ):
             while True:
                 key = key_source()
                 if key is None:
@@ -2043,9 +2131,9 @@ def _run_picker(
             with Live(
                 _render(),
                 console=console,
-                refresh_per_second=30,
-                transient=True,
-                screen=False,
+                refresh_per_second=12,
+                transient=False,
+                screen=True,
             ) as live:
                 while True:
                     key = _read_one_key(raw)
@@ -2109,6 +2197,7 @@ def _row_album(a: AlbumMatch) -> list[str]:
         a.title,
         str(len(a.tracks)),
         a.display_artist,
+        a.quality,
     ]
 
 
@@ -2184,6 +2273,7 @@ def select_albums(
                 ("Album", "blue"),
                 ("Tracks", "yellow"),
                 ("Artist", "green"),
+                ("Quality", "cyan"),
             ],
             items=albums,
             row_fn=_row_album,
@@ -2240,6 +2330,7 @@ def _select_albums_with_keys(
             ("Album", "blue"),
             ("Tracks", "yellow"),
             ("Artist", "green"),
+            ("Quality", "cyan"),
         ],
         items=albums,
         row_fn=_row_album,

@@ -18,6 +18,7 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from monochrome_cli import (
     AlbumMatch,
+    DEFAULT_CFG_QUALITY,
     EXT_FOR_FORMAT,
     KEY_BACKSPACE,
     KEY_DOWN,
@@ -32,6 +33,7 @@ from monochrome_cli import (
     MonochromeClient,
     PickerState,
     TrackMatch,
+    VALID_QUALITIES,
     _TerminalRaw,
     _detect_format_from_bytes,
     _detect_format_from_content_type,
@@ -39,9 +41,12 @@ from monochrome_cli import (
     _parse_album_selection,
     _parse_key_bytes,
     _read_one_key,
+    _resolve_default_quality,
     _select_albums_with_keys,
     artist_matches,
     classify_error,
+    download_albums,
+    download_discography,
     download_file,
     download_single,
     fix_extensions,
@@ -774,6 +779,204 @@ class TestDownloadSingleStatusLog:
         )
         assert status == "skipped"
         assert any("already exists" in m for m in log)
+
+
+class TestDownloadDiscography:
+    """Discography mode routes through ``select_albums`` (TUI by default)
+    and then a shared ``download_albums`` loop.
+    """
+
+    def _albums(self, n: int) -> list[AlbumMatch]:
+        out: list[AlbumMatch] = []
+        for i in range(n):
+            tracks = [
+                TrackMatch(
+                    tidal_id=j,
+                    title=f"Track {j}",
+                    artists=["Artist"],
+                    album=f"Album {i}",
+                    duration_sec=180,
+                    quality="LOSELESS",
+                )
+                for j in range(i + 1)
+            ]
+            out.append(AlbumMatch(title=f"Album {i}", artists=["Artist"], tracks=tracks))
+        return out
+
+    def test_empty_selection_returns_zero(self):
+        client = MagicMock()
+        with patch(
+            "monochrome_cli.select_albums",
+            return_value=[],
+        ) as mock_pick:
+            result = download_discography(
+                client, self._albums(3), Path("/tmp"), "Artist",
+                force_tui=True,
+            )
+        assert result == 0
+        mock_pick.assert_called_once()
+        client.assert_not_called()
+
+    def test_selection_passes_force_tui(self):
+        client = MagicMock()
+        with patch(
+            "monochrome_cli.select_albums",
+            return_value=self._albums(2),
+        ) as mock_pick, patch(
+            "monochrome_cli.download_albums",
+            return_value=5,
+        ) as mock_loop:
+            download_discography(
+                client, self._albums(3), Path("/tmp"), "Daft Punk",
+                force_tui=False,
+            )
+        # forward force_tui to the picker
+        _args, kwargs = mock_pick.call_args
+        assert kwargs.get("force_tui") is False
+        # forward artist_folder to the loop
+        _args, kwargs = mock_loop.call_args
+        assert kwargs.get("artist_folder") == "Daft Punk"
+        assert kwargs.get("summary_title") == "Discography Summary"
+
+    def test_auto_force_tui_when_unspecified(self):
+        with patch(
+            "monochrome_cli.select_albums",
+            return_value=[],
+        ) as mock_pick:
+            download_discography(
+                MagicMock(), self._albums(1), Path("/tmp"), "Artist",
+            )
+        _args, kwargs = mock_pick.call_args
+        assert kwargs.get("force_tui") is None  # auto-detect
+
+    def test_download_albums_single_skips_summary(self):
+        """A one-album selection should call download_album once and
+        return its result, without rendering a summary table."""
+        with patch(
+            "monochrome_cli.download_album",
+            return_value=3,
+        ) as mock_dl:
+            result = download_albums(
+                MagicMock(), self._albums(1), Path("/tmp"),
+                artist_folder="Artist",
+            )
+        assert result == 3
+        assert mock_dl.call_count == 1
+
+    def test_download_albums_multi_runs_loop(self):
+        albums = self._albums(3)
+        with patch(
+            "monochrome_cli.download_album",
+            side_effect=[5, 4, 3],
+        ) as mock_dl:
+            result = download_albums(
+                MagicMock(), albums, Path("/tmp"),
+                artist_folder="Artist",
+                summary_title="Test Summary",
+            )
+        assert result == 12
+        assert mock_dl.call_count == 3
+        # index tuple is (i, total)
+        for i, call in enumerate(mock_dl.call_args_list, 1):
+            assert call.kwargs["album_index"] == (i, 3)
+            assert call.kwargs["artist_folder"] == "Artist"
+
+
+class TestAlbumMatchQuality:
+    """AlbumMatch.quality should report the best (highest) quality across
+    the album's tracks.
+    """
+
+    def _track(self, quality: str) -> TrackMatch:
+        return TrackMatch(
+            tidal_id=1,
+            title="t",
+            artists=["a"],
+            album="alb",
+            duration_sec=180,
+            quality=quality,
+        )
+
+    def test_no_tracks_returns_dash(self):
+        a = AlbumMatch(title="Empty", artists=["x"], tracks=[])
+        assert a.quality == "—"
+
+    def test_single_track_quality(self):
+        a = AlbumMatch(title="t", artists=["x"], tracks=[self._track("LOSSLESS")])
+        assert a.quality == "LOSSLESS"
+
+    def test_best_of_mixed(self):
+        a = AlbumMatch(
+            title="t", artists=["x"],
+            tracks=[self._track("LOW"), self._track("HI_RES_LOSSLESS"), self._track("HIGH")],
+        )
+        assert a.quality == "HI_RES_LOSSLESS"
+
+    def test_ignores_tracks_with_no_quality(self):
+        a = AlbumMatch(
+            title="t", artists=["x"],
+            tracks=[self._track(""), self._track("HIGH")],
+        )
+        assert a.quality == "HIGH"
+
+
+class TestResolveDefaultQuality:
+    """Priority: -q CLI > MONOCHROME_DL_QUALITY env > config.json "quality"
+    > "HIGH" fallback. Invalid values fall back to HIGH with a warning.
+    """
+
+    def setup_method(self):
+        self._env = os.environ.copy()
+
+    def teardown_method(self):
+        os.environ.clear()
+        os.environ.update(self._env)
+
+    def test_env_beats_config(self):
+        real_get = os.environ.get
+        with patch("monochrome_cli._cfg", {"quality": "HI_RES_LOSSLESS"}), \
+             patch(
+                 "monochrome_cli.os.environ.get",
+                 side_effect=lambda k, *a: "LOSSLESS" if k == "MONOCHROME_DL_QUALITY" else real_get(k, *a),
+             ):
+            assert _resolve_default_quality() == "LOSSLESS"
+
+    def test_config_used_when_no_env(self):
+        real_get = os.environ.get
+        with patch("monochrome_cli._cfg", {"quality": "HI_RES_LOSSLESS"}), \
+             patch(
+                 "monochrome_cli.os.environ.get",
+                 side_effect=lambda k, *a: None if k == "MONOCHROME_DL_QUALITY" else real_get(k, *a),
+             ):
+            assert _resolve_default_quality() == "HI_RES_LOSSLESS"
+
+    def test_fallback_high_when_nothing_set(self):
+        real_get = os.environ.get
+        with patch("monochrome_cli._cfg", {}), \
+             patch(
+                 "monochrome_cli.os.environ.get",
+                 side_effect=lambda k, *a: None if k == "MONOCHROME_DL_QUALITY" else real_get(k, *a),
+             ):
+            assert _resolve_default_quality() == "HIGH"
+
+    def test_invalid_env_value_falls_back(self):
+        real_get = os.environ.get
+        with patch("monochrome_cli._cfg", {}), \
+             patch(
+                 "monochrome_cli.os.environ.get",
+                 side_effect=lambda k, *a: "NONSENSE" if k == "MONOCHROME_DL_QUALITY" else real_get(k, *a),
+             ):
+            assert _resolve_default_quality() == "HIGH"
+
+    def test_valid_qualities_accepted(self):
+        for q in VALID_QUALITIES:
+            real_get = os.environ.get
+            with patch("monochrome_cli._cfg", {}), \
+                 patch(
+                     "monochrome_cli.os.environ.get",
+                     side_effect=lambda k, *a, _q=q: _q if k == "MONOCHROME_DL_QUALITY" else real_get(k, *a),
+                 ):
+                assert _resolve_default_quality() == q
 
 
 # ─── MonochromeClient tests ───

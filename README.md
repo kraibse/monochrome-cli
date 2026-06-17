@@ -51,7 +51,7 @@ python monochrome_cli.py -a "artist name"
 
 ### Discography search
 
-Download every album for an artist in one go.
+List every album for an artist and download one or more. Album results are presented for selection, so you can pick a single release, a subset, or the full set.
 
 ```bash
 # Full discography (tracks limited to the artist)
@@ -153,9 +153,10 @@ If no config file is found, built-in defaults are used.
 
 Create `config.json` (or `~/.config/monochrome-cli/config.json`):
 
-```json
+ ```json
 {
   "output_dir": "~/Music",
+  "quality": "LOSSLESS",
   "monochrome_mirrors": [
     "https://extra-monochrome-mirror-1.com",
     "https://extra-monochrome-mirror-2.com"
@@ -172,24 +173,26 @@ Create `config.json` (or `~/.config/monochrome-cli/config.json`):
 | Key | Type | Description |
 |-----|------|-------------|
 | `output_dir` | string | Default download directory |
+| `quality` | string | Default stream quality: `LOW`, `HIGH`, `LOSSLESS`, or `HI_RES_LOSSLESS` (default: `HIGH`) |
 | `monochrome_mirrors` | list of strings | Custom Monochrome API mirror URLs |
 | `qobuz_mirrors` | list of strings | Custom Qobuz API mirror URLs |
 
 ### Priority
 
-1. **CLI flags** (`--mirrors`, `--qobuz-mirrors`, `-o`) override everything
+1. **CLI flags** (`--mirrors`, `--qobuz-mirrors`, `-o`, `-q`) override everything
 2. **Config file** values override built-in defaults
 3. **Built-in defaults** are used as fallback
 
-### Environment Variable
+### Environment Variables
 
-You can also set the output directory via environment variable:
+The output directory and default quality can be set via environment variables:
 
 ```bash
 export MONOCHROME_DL_OUTPUT=~/Music
+export MONOCHROME_DL_QUALITY=LOSSLESS
 ```
 
-This overrides the config file but is overridden by the `-o` CLI flag.
+These override the config file but are overridden by the `-o` and `-q` CLI flags, respectively.
 
 ## How It Works
 
