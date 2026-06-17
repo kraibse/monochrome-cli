@@ -133,6 +133,39 @@ python monochrome_cli.py --fix-extensions ~/Music
 
 It scans every regular file under the directory, sniffs the first 16 bytes, and renames mismatches (e.g. `Pizza Hotline - AIR.flac` → `Pizza Hotline - AIR.m4a`). It skips non-audio files, already-correctly-named files, and any case where the target path is already occupied. The exit status is 0 either way; a summary of scanned / renamed counts is printed at the end.
 
+### Live Progress UI
+
+Album, discography, and CSV downloads use a stacked live progress display that stays compact (no scrolling) and shows aggregate counters as tracks complete. The display re-renders in place via `rich.live.Live`; per-track status messages (skips, failures, stream-URL errors) are collected during the download and printed as a single notes table once the live region closes.
+
+```
+┌──────────────────────────────────────────────────────────────┐
+│  Album 2/5 — Album                                           │
+│  AIR by Pizza Hotline                                        │
+│  8 track(s) → downloads/Pizza Hotline/AIR                    │
+└──────────────────────────────────────────────────────────────┘
+
+Overall  [████████░░░░░░░░░░] 3/8   ✓3  ⊘1  ✗0
+Track   [3/8] Intravenus  [██████████] 4.2/8.2 MB  12.4 MB/s  0:00:02
+```
+
+After the download finishes:
+
+```
+┏━━━━━━━━━━━━━━━━┳━━━━━━━┓
+┃ Status         ┃ Count  ┃
+┡━━━━━━━━━━━━━━━━╇━━━━━━━┩
+│ Downloaded     │     3  │
+│ Skipped        │     1  │
+│ Failed         │     0  │
+└────────────────┴───────┘
+
+Per-track notes
+  1. [yellow][skip] Track 4: already exists[/yellow]
+  2. [red][skip] Track 5: failed to get stream URL: mirror 503[/red]
+```
+
+Discography runs each album in sequence with its own live region; the album panel header is `Album 1/5 — Album`, `Album 2/5 — Album`, etc. CSV playlists get the same layout with an extra `?{missing}` counter for rows that had no track/artist data.
+
 ## Configuration
 
 Configuration is loaded from JSON files in the following priority:

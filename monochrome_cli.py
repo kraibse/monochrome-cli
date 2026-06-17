@@ -18,11 +18,13 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 
 import requests
-from rich.console import Console
+from rich.console import Console, Group
+from rich.live import Live
 from rich.panel import Panel
 from rich.progress import (
     BarColumn,
     DownloadColumn,
+    MofNCompleteColumn,
     Progress,
     TextColumn,
     TimeRemainingColumn,
@@ -1016,11 +1018,31 @@ def pick_album(albums: list[AlbumMatch]) -> AlbumMatch | None:
     return selected[0] if selected else None
 
 
-def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Path, progress: Progress) -> str:
+def _note(log: list[str] | None, message: str) -> None:
+    """Append ``message`` to ``log`` if provided, else print to ``console``.
+
+    Used by ``download_single`` to defer per-track status messages until after
+    the live progress region closes — avoids interleaving prints with the
+    Live display and producing a scrolling wall of text.
+    """
+    if log is None:
+        console.print(message)
+    else:
+        log.append(message)
+
+
+def download_single(
+    client: MonochromeClient,
+    track: TrackMatch,
+    output_dir: Path,
+    progress: Progress,
+    task_id: int,
+    status_log: list[str] | None = None,
+) -> str:
     try:
         stream_url = client.get_stream_url(track.tidal_id, quality=client.quality, isrc=track.isrc)
     except Exception as exc:
-        console.print(f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
+        _note(status_log, f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
         return "failed"
 
     raw_name = f"{', '.join(track.artists)} - {track.title}"
@@ -1028,7 +1050,7 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
     base = output_dir / safe_name
     try:
         if _existing_audio(base) is not None:
-            console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
+            _note(status_log, f"[yellow][skip] {track.title}: already exists[/yellow]")
             return "skipped"
     except OSError:
         # Path too long — try progressively shorter names
@@ -1037,32 +1059,59 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
             short_base = output_dir / short_name
             try:
                 if _existing_audio(short_base) is not None:
-                    console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
+                    _note(status_log, f"[yellow][skip] {track.title}: already exists[/yellow]")
                     return "skipped"
                 base = short_base
                 break
             except OSError:
                 continue
         else:
-            console.print(f"[red][skip] {track.title}: path too long[/red]")
+            _note(status_log, f"[red][skip] {track.title}: path too long[/red]")
             return "failed"
 
-    task_id = progress.add_task(f"[cyan]{track.title}", start=True)
     try:
         download_file(stream_url, base, progress, task_id)
         progress.update(task_id, description=f"[green]✓ {track.title}")
         return "downloaded"
     except KeyboardInterrupt:
         progress.update(task_id, description=f"[red]✗ {track.title}")
-        console.print(f"[yellow]Interrupted: {track.title}[/yellow]")
+        _note(status_log, f"[yellow]Interrupted: {track.title}[/yellow]")
         raise
     except Exception as exc:
         progress.update(task_id, description=f"[red]✗ {track.title}")
-        console.print(f"[red][skip] {track.title}: download failed: {exc}[/red]")
+        _note(status_log, f"[red][skip] {track.title}: download failed: {exc}[/red]")
         return "failed"
 
 
-def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, artist_folder: str | None = None) -> int:
+def _format_counters(downloaded: int, skipped: int, failed: int) -> str:
+    """Render the inline counter column used in the album overall progress bar."""
+    return (
+        f"  [green]✓{downloaded}[/green]  "
+        f"[yellow]⊘{skipped}[/yellow]  "
+        f"[red]✗{failed}[/red]"
+    )
+
+
+def _print_notes_table(notes: list[str], title: str = "Notes") -> None:
+    """Render collected per-track status messages as a table, or skip if empty."""
+    if not notes:
+        return
+    table = Table(title=title, show_header=False, box=None, padding=(0, 1))
+    table.add_column("#", style="dim", justify="right")
+    table.add_column("Detail")
+    for i, msg in enumerate(notes, 1):
+        # Strip rich markup wrappers for the table cell — let the table render the row plainly.
+        table.add_row(str(i), msg)
+    console.print(table)
+
+
+def download_album(
+    client: MonochromeClient,
+    album: AlbumMatch,
+    base_dir: Path,
+    artist_folder: str | None = None,
+    album_index: tuple[int, int] | None = None,
+) -> int:
     artist_dir = sanitize_filename(artist_folder) if artist_folder else sanitize_filename(album.display_artist)
     album_dir = sanitize_filename(album.title)
     out = base_dir / artist_dir / album_dir
@@ -1083,35 +1132,91 @@ def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, 
             console.print(f"[red][skip] Album path too long: {album.title}[/red]")
             return 0
 
+    title = f"[bold cyan]Downloading {album.inferred_type}[/bold cyan]"
+    if album_index is not None:
+        i, n = album_index
+        title = f"[bold cyan]Album {i}/{n} — {album.inferred_type}[/bold cyan]"
+
     console.print(Panel(
         f"[bold]{album.title}[/bold] by {album.display_artist}\n"
         f"[dim]{len(album.tracks)} track(s) → {out}[/dim]",
-        title=f"[bold cyan]Downloading {album.inferred_type}[/bold cyan]",
+        title=title,
         border_style="cyan",
     ))
 
+    total = len(album.tracks)
     downloaded = skipped = failed = 0
+    notes: list[str] = []
+    overall_progress = Progress(
+        TextColumn("[bold cyan]Overall [/bold cyan]"),
+        BarColumn(bar_width=24),
+        MofNCompleteColumn(),
+        TextColumn("{task.description}"),
+        console=console,
+    )
+    track_progress = Progress(
+        TextColumn("[cyan]Track   [/cyan]"),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=24),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+
+    interrupted = False
     try:
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
+        with Live(
+            Group(overall_progress, track_progress),
             console=console,
-        ) as progress:
-            for track in album.tracks:
-                status = download_single(client, track, out, progress)
+            refresh_per_second=10,
+            transient=False,
+        ):
+            overall_task = overall_progress.add_task(
+                _format_counters(0, 0, 0), total=total
+            )
+            track_task = track_progress.add_task("", total=None)
+            for idx, track in enumerate(album.tracks, 1):
+                track_progress.update(
+                    track_task,
+                    description=f"[{idx}/{total}] {track.title}",
+                    total=None,
+                )
+                status = download_single(
+                    client, track, out, track_progress, track_task, status_log=notes
+                )
                 if status == "downloaded":
                     downloaded += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[green]✓ [{idx}/{total}] {track.title}[/green]",
+                    )
                 elif status == "skipped":
                     skipped += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[yellow]⊘ [{idx}/{total}] {track.title}[/yellow]",
+                    )
                 else:
                     failed += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[red]✗ [{idx}/{total}] {track.title}[/red]",
+                    )
+                overall_progress.update(
+                    overall_task,
+                    advance=1,
+                    description=_format_counters(downloaded, skipped, failed),
+                )
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        interrupted = True
+        notes.append("[yellow]Interrupted by user.[/yellow]")
 
-    summary = Table(title=f"Album Summary: {album.title} ({len(album.tracks)} tracks)", show_header=True)
+    summary = Table(
+        title=f"Summary: [bold]{album.title}[/bold]  [dim]({total} tracks)[/dim]",
+        title_justify="left",
+        show_header=True,
+    )
     summary.add_column("Status", style="bold")
     summary.add_column("Count", justify="right")
     summary.add_row("[green]Downloaded[/green]", str(downloaded))
@@ -1120,8 +1225,9 @@ def download_album(client: MonochromeClient, album: AlbumMatch, base_dir: Path, 
     if failed:
         summary.add_row("[red]Failed[/red]", str(failed))
     console.print(summary)
+    _print_notes_table(notes, title="Per-track notes")
     console.print()
-    return downloaded
+    return downloaded if not interrupted else downloaded
 
 
 def download_discography(client: MonochromeClient, albums: list[AlbumMatch], base_dir: Path, artist_query: str) -> int:
@@ -1143,13 +1249,28 @@ def download_discography(client: MonochromeClient, albums: list[AlbumMatch], bas
 
     total_downloaded = 0
     try:
-        for album in albums:
-            total_downloaded += download_album(client, album, base_dir, artist_folder=artist_query)
+        for i, album in enumerate(albums, 1):
+            total_downloaded += download_album(
+                client,
+                album,
+                base_dir,
+                artist_folder=artist_query,
+                album_index=(i, len(albums)),
+            )
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/yellow]")
 
     console.print(f"[bold green]Discography complete: {total_downloaded}/{total_tracks} tracks saved across {len(albums)} album(s)[/bold green]")
     return total_downloaded
+
+
+def _format_csv_counters(downloaded: int, skipped: int, failed: int, missing: int) -> str:
+    return (
+        f"  [green]✓{downloaded}[/green]  "
+        f"[yellow]⊘{skipped}[/yellow]  "
+        f"[red]✗{failed}[/red]  "
+        f"[magenta]?{missing}[/magenta]"
+    )
 
 
 def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path) -> int:
@@ -1177,27 +1298,47 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
 
     downloaded = skipped = failed = missing = 0
     total = len(rows)
+    notes: list[str] = []
+    overall_progress = Progress(
+        TextColumn("[bold cyan]Overall [/bold cyan]"),
+        BarColumn(bar_width=24),
+        MofNCompleteColumn(),
+        TextColumn("{task.description}"),
+        console=console,
+    )
+    track_progress = Progress(
+        TextColumn("[cyan]Track   [/cyan]"),
+        TextColumn("{task.description}"),
+        BarColumn(bar_width=24),
+        DownloadColumn(),
+        TransferSpeedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
 
-    def _overall_desc() -> str:
-        return f"[bold cyan]Overall: {downloaded + skipped + failed + missing}/{total} | Down: {downloaded} | Skip: {skipped} | Fail: {failed} | Miss: {missing}[/bold cyan]"
-
+    interrupted = False
     try:
-        with Progress(
-            TextColumn("[progress.description]{task.description}"),
-            BarColumn(),
-            DownloadColumn(),
-            TransferSpeedColumn(),
-            TimeRemainingColumn(),
+        with Live(
+            Group(overall_progress, track_progress),
             console=console,
-        ) as progress:
-            overall_task = progress.add_task(_overall_desc(), total=total)
-            for row in rows:
+            refresh_per_second=10,
+            transient=False,
+        ):
+            overall_task = overall_progress.add_task(
+                _format_csv_counters(0, 0, 0, 0), total=total
+            )
+            track_task = track_progress.add_task("", total=None)
+            for idx, row in enumerate(rows, 1):
                 track_name = row.get("Track Name", "").strip()
                 artists_raw = row.get("Artist Name(s)", "").strip()
                 if not track_name or not artists_raw:
                     missing += 1
-                    console.print("[yellow][skip] Missing track/artist in CSV row[/yellow]")
-                    progress.update(overall_task, advance=1, description=_overall_desc())
+                    notes.append("[yellow][skip] Missing track/artist in CSV row[/yellow]")
+                    overall_progress.update(
+                        overall_task,
+                        advance=1,
+                        description=_format_csv_counters(downloaded, skipped, failed, missing),
+                    )
                     continue
 
                 query = f"{artists_raw} - {track_name}"
@@ -1205,31 +1346,62 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
                     tracks, _ = client.search(query, limit=8)
                 except Exception as exc:
                     failed += 1
-                    console.print(f"[yellow][skip] Search failed for '{query}': {exc}[/yellow]")
-                    progress.update(overall_task, advance=1, description=_overall_desc())
+                    notes.append(f"[yellow][skip] Search failed for '{query}': {exc}[/yellow]")
+                    overall_progress.update(
+                        overall_task,
+                        advance=1,
+                        description=_format_csv_counters(downloaded, skipped, failed, missing),
+                    )
                     continue
 
                 if not tracks:
                     failed += 1
-                    console.print(f"[red][fail] No results for '{query}'[/red]")
-                    progress.update(overall_task, advance=1, description=_overall_desc())
+                    notes.append(f"[red][fail] No results for '{query}'[/red]")
+                    overall_progress.update(
+                        overall_task,
+                        advance=1,
+                        description=_format_csv_counters(downloaded, skipped, failed, missing),
+                    )
                     continue
 
                 # Pick first result
                 track = tracks[0]
-                status = download_single(client, track, out, progress)
+                track_progress.update(
+                    track_task,
+                    description=f"[{idx}/{total}] {track.artists[0] if track.artists else '?'} - {track.title}",
+                    total=None,
+                )
+                status = download_single(
+                    client, track, out, track_progress, track_task, status_log=notes
+                )
                 if status == "downloaded":
                     downloaded += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[green]✓ [{idx}/{total}] {track.title}[/green]",
+                    )
                 elif status == "skipped":
                     skipped += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[yellow]⊘ [{idx}/{total}] {track.title}[/yellow]",
+                    )
                 else:
                     failed += 1
+                    track_progress.update(
+                        track_task,
+                        description=f"[red]✗ [{idx}/{total}] {track.title}[/red]",
+                    )
 
-                progress.update(overall_task, advance=1, description=_overall_desc())
+                overall_progress.update(
+                    overall_task,
+                    advance=1,
+                    description=_format_csv_counters(downloaded, skipped, failed, missing),
+                )
     except KeyboardInterrupt:
-        console.print("\n[yellow]Interrupted by user.[/yellow]")
+        interrupted = True
+        notes.append("[yellow]Interrupted by user.[/yellow]")
 
-    # Final summary
     summary = Table(title=f"Playlist Summary: {csv_path.name}")
     summary.add_column("Status", style="bold")
     summary.add_column("Count", justify="right")
@@ -1242,7 +1414,9 @@ def download_from_csv(client: MonochromeClient, csv_path: Path, output_dir: Path
         summary.add_row("[dim]Missing data (CSV)[/dim]", str(missing))
     summary.add_row("[bold]Total processed[/bold]", str(total))
     console.print(summary)
-    return downloaded
+    _print_notes_table(notes, title="Per-row notes")
+    console.print()
+    return downloaded if not interrupted else downloaded
 
 
 def _check_mirror(session: requests.Session, url: str, path: str, timeout: int = 8) -> dict[str, Any]:
@@ -1366,13 +1540,15 @@ def _main() -> int:
             return 0
 
         if len(selected) == 1:
-            download_album(client, selected[0], args.output)
+            download_album(client, selected[0], args.output, album_index=(1, 1))
         else:
             total_downloaded = 0
             total_tracks = sum(len(a.tracks) for a in selected)
             try:
-                for album in selected:
-                    total_downloaded += download_album(client, album, args.output)
+                for i, album in enumerate(selected, 1):
+                    total_downloaded += download_album(
+                        client, album, args.output, album_index=(i, len(selected))
+                    )
             except KeyboardInterrupt:
                 console.print("\n[yellow]Interrupted by user.[/yellow]")
 

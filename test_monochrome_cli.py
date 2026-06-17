@@ -30,6 +30,7 @@ from monochrome_cli import (
     artist_matches,
     classify_error,
     download_file,
+    download_single,
     fix_extensions,
     normalize_artist,
     pick_albums,
@@ -634,6 +635,130 @@ class TestFixExtensions:
         renamed, scanned = fix_extensions(tmp_path)
         assert renamed == 0
         assert scanned == 0
+
+
+class TestDownloadSingleStatusLog:
+    """``download_single`` should accept a ``status_log`` list and append
+    per-track messages to it instead of calling ``console.print`` while a
+    live progress display is active."""
+
+    def _make_client(self, *, stream_url: str | Exception = "http://x/stream") -> MonochromeClient:
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        if isinstance(stream_url, Exception):
+            client.get_stream_url.side_effect = stream_url
+        else:
+            client.get_stream_url.return_value = stream_url
+        return client
+
+    def _make_track(self, title: str = "Song") -> TrackMatch:
+        return TrackMatch(
+            title=title,
+            artists=["Artist"],
+            tidal_id=1,
+            isrc=None,
+            album="Test Album",
+            duration_sec=180,
+            quality="HIGH",
+        )
+
+    def test_status_log_captures_stream_url_failure(self, tmp_path):
+        client = self._make_client(stream_url=Exception("mirror down"))
+        track = self._make_track()
+        log: list[str] = []
+        progress = MagicMock()
+
+        with patch("monochrome_cli.console.print") as mock_print:
+            status = download_single(
+                client, track, tmp_path, progress, task_id=0, status_log=log
+            )
+
+        assert status == "failed"
+        assert len(log) == 1
+        assert "[skip]" in log[0]
+        assert "mirror down" in log[0]
+        # console.print must NOT have been called — the message went to the log.
+        mock_print.assert_not_called()
+
+    def test_status_log_captures_already_exists(self, tmp_path):
+        # Pre-create a .flac file at the expected stem to trigger the skip path.
+        (tmp_path / "Artist - Song.flac").write_bytes(b"fLaC")
+        client = self._make_client()
+        track = self._make_track()
+        log: list[str] = []
+        progress = MagicMock()
+
+        with patch("monochrome_cli.console.print") as mock_print:
+            status = download_single(
+                client, track, tmp_path, progress, task_id=0, status_log=log
+            )
+
+        assert status == "skipped"
+        assert len(log) == 1
+        assert "already exists" in log[0]
+        mock_print.assert_not_called()
+
+    def test_without_status_log_prints_to_console(self, tmp_path):
+        # Back-compat: if status_log is None, messages still go to console.print.
+        client = self._make_client(stream_url=Exception("nope"))
+        track = self._make_track()
+        progress = MagicMock()
+
+        with patch("monochrome_cli.console.print") as mock_print:
+            status = download_single(
+                client, track, tmp_path, progress, task_id=0, status_log=None
+            )
+
+        assert status == "failed"
+        mock_print.assert_called_once()
+        # The first positional arg should be the formatted message.
+        rendered = str(mock_print.call_args.args[0])
+        assert "[skip]" in rendered
+        assert "nope" in rendered
+
+    def test_keyboard_interrupt_appends_to_log_and_reraises(self, tmp_path):
+        # When download_file raises KeyboardInterrupt, the message goes to
+        # the log and the exception propagates.
+        client = self._make_client()
+        track = self._make_track()
+        log: list[str] = []
+        progress = MagicMock()
+
+        with patch("monochrome_cli.download_file", side_effect=KeyboardInterrupt):
+            with pytest.raises(KeyboardInterrupt):
+                download_single(
+                    client, track, tmp_path, progress, task_id=0, status_log=log
+                )
+        assert any("Interrupted" in m for m in log)
+
+    def test_keyboard_interrupt_without_log_prints(self, tmp_path):
+        # Back-compat path: KeyboardInterrupt prints and re-raises.
+        client = self._make_client()
+        track = self._make_track()
+        progress = MagicMock()
+
+        with patch("monochrome_cli.console.print") as mock_print:
+            with patch("monochrome_cli.download_file", side_effect=KeyboardInterrupt):
+                with pytest.raises(KeyboardInterrupt):
+                    download_single(
+                        client, track, tmp_path, progress, task_id=0, status_log=None
+                    )
+        assert any("Interrupted" in str(c.args[0]) for c in mock_print.call_args_list)
+
+    def test_existing_audio_with_m4a_extension(self, tmp_path):
+        # Skip-detection should also work for .m4a files (the case the
+        # format-detection fix introduced).
+        (tmp_path / "Artist - Song.m4a").write_bytes(
+            b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 50
+        )
+        client = self._make_client()
+        track = self._make_track()
+        log: list[str] = []
+        status = download_single(
+            client, track, tmp_path, MagicMock(), task_id=0, status_log=log
+        )
+        assert status == "skipped"
+        assert any("already exists" in m for m in log)
 
 
 # ─── MonochromeClient tests ───
