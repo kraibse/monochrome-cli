@@ -31,6 +31,13 @@ python monochrome_cli.py "artist - song title"
 # Search and download an album
 python monochrome_cli.py -a "artist - album title"
 
+# When prompted, you can pick multiple albums at once, e.g.:
+#   1,3,5      -> albums #1, #3, and #5
+#   1-3        -> albums #1, #2, and #3
+#   all        -> every album in the list
+#   0          -> cancel
+python monochrome_cli.py -a "artist name"
+
 # Search and download a full discography
 python monochrome_cli.py -d "artist name"
 
@@ -42,7 +49,7 @@ python monochrome_cli.py -d --no-strict "artist name"
 
 | Flag | Description |
 |------|-------------|
-| `-a`, `--album` | Search for albums and bulk download |
+| `-a`, `--album` | Search for albums and bulk download (supports multi-select) |
 | `-d`, `--discography` | Search for artist discography and download all albums |
 | `--no-strict` | In discography mode, include tracks from other artists matching the query |
 | `-n`, `--limit` | Tracks per search page (default: 50) |

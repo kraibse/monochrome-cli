@@ -28,7 +28,7 @@ from rich.progress import (
     TimeRemainingColumn,
     TransferSpeedColumn,
 )
-from rich.prompt import Confirm, IntPrompt
+from rich.prompt import Confirm, IntPrompt, Prompt
 from rich.table import Table
 
 console = Console()
@@ -728,10 +728,73 @@ def pick_track(tracks: list[TrackMatch]) -> TrackMatch | None:
         console.print("[red]Invalid choice.[/red]")
 
 
-def pick_album(albums: list[AlbumMatch]) -> AlbumMatch | None:
+def _parse_album_selection(raw: str, total: int) -> list[int] | None:
+    """Parse a user selection string into a sorted, de-duplicated list of 1-based
+    album indices.
+
+    Accepted forms (mixed freely, whitespace or commas as separators):
+      - ``0`` / ``""`` / ``"q"`` / ``"quit"`` → ``None`` (cancel)
+      - ``"all"`` / ``"*"``                  → all indices ``[1..total]``
+      - ``"3"``                              → ``[3]``
+      - ``"1,3,5"`` or ``"1 3 5"``           → ``[1, 3, 5]``
+      - ``"1-3"``                            → ``[1, 2, 3]``
+
+    Returns ``None`` to signal cancellation, or raises ``ValueError`` for any
+    token that cannot be parsed or that is out of range.
+    """
+    if total <= 0:
+        return None
+
+    text = (raw or "").strip().lower()
+    if text in ("", "0", "q", "quit", "cancel"):
+        return None
+    if text in ("all", "*", "a"):
+        return list(range(1, total + 1))
+
+    # Normalize separators: commas and whitespace both split tokens.
+    text = text.replace(",", " ")
+    tokens = [t for t in text.split() if t]
+
+    indices: set[int] = set()
+    for tok in tokens:
+        if "-" in tok:
+            head, _, tail = tok.partition("-")
+            if not head or not tail:
+                raise ValueError(f"invalid range: {tok!r}")
+            try:
+                start = int(head)
+                end = int(tail)
+            except ValueError as exc:
+                raise ValueError(f"not a number: {tok!r}") from exc
+            if start > end:
+                start, end = end, start
+            if start < 1 or end > total:
+                raise ValueError(f"out of range: {tok!r} (valid: 1-{total})")
+            indices.update(range(start, end + 1))
+        else:
+            try:
+                n = int(tok)
+            except ValueError as exc:
+                raise ValueError(f"not a number: {tok!r}") from exc
+            if n < 1 or n > total:
+                raise ValueError(f"out of range: {n} (valid: 1-{total})")
+            indices.add(n)
+
+    if not indices:
+        return None
+    return sorted(indices)
+
+
+def pick_albums(albums: list[AlbumMatch]) -> list[AlbumMatch]:
+    """Interactively let the user choose one or more albums from ``albums``.
+
+    Returns the selected albums in display order, or an empty list if the user
+    cancelled. Supports comma-separated numbers, ranges (``1-3``), ``all``,
+    and a bare ``0``/empty input to cancel.
+    """
     if not albums:
         console.print("[yellow]No albums found.[/yellow]")
-        return None
+        return []
     albums = sorted(albums, key=lambda a: len(a.tracks), reverse=True)
     table = Table(title=f"Found {len(albums)} album(s)")
     table.add_column("#", style="cyan", no_wrap=True)
@@ -742,13 +805,27 @@ def pick_album(albums: list[AlbumMatch]) -> AlbumMatch | None:
     for i, a in enumerate(albums, 1):
         table.add_row(str(i), a.inferred_type, a.title, str(len(a.tracks)), a.display_artist)
     console.print(table)
+
+    help_text = (
+        "Pick one or more (e.g. [bold]1,3,5[/bold] or [bold]1-3[/bold] or [bold]all[/bold]; "
+        "[bold]0[/bold] to quit)"
+    )
     while True:
-        choice = IntPrompt.ask("Pick a number (0 to quit)", default=0)
-        if choice == 0:
-            return None
-        if 1 <= choice <= len(albums):
-            return albums[choice - 1]
-        console.print("[red]Invalid choice.[/red]")
+        raw = Prompt.ask(help_text, default="").strip()
+        try:
+            indices = _parse_album_selection(raw, len(albums))
+        except ValueError as exc:
+            console.print(f"[red]{exc}[/red]")
+            continue
+        if indices is None:
+            return []
+        return [albums[i - 1] for i in indices]
+
+
+def pick_album(albums: list[AlbumMatch]) -> AlbumMatch | None:
+    """Backwards-compatible single-album picker. Returns ``None`` on cancel."""
+    selected = pick_albums(albums)
+    return selected[0] if selected else None
 
 
 def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Path, progress: Progress) -> str:
@@ -1083,11 +1160,33 @@ def _main() -> int:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
 
-        album = pick_album(albums)
-        if not album:
+        selected = pick_albums(albums)
+        if not selected:
             return 0
 
-        download_album(client, album, args.output)
+        if len(selected) == 1:
+            download_album(client, selected[0], args.output)
+        else:
+            total_downloaded = 0
+            total_tracks = sum(len(a.tracks) for a in selected)
+            try:
+                for album in selected:
+                    total_downloaded += download_album(client, album, args.output)
+            except KeyboardInterrupt:
+                console.print("\n[yellow]Interrupted by user.[/yellow]")
+
+            summary = Table(
+                title=f"Multi-Album Summary: {len(selected)} album(s) selected",
+                show_header=True,
+            )
+            summary.add_column("Status", style="bold")
+            summary.add_column("Count", justify="right")
+            summary.add_row(
+                f"[green]Downloaded[/green] ({len(selected)} albums, {total_tracks} tracks)",
+                str(total_downloaded),
+            )
+            console.print(summary)
+            console.print()
     else:
         console.print(f"[bold]Searching tracks for: {query}[/bold]")
         try:

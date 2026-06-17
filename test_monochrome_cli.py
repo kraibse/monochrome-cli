@@ -22,9 +22,11 @@ from monochrome_cli import (
     MirrorStats,
     MonochromeClient,
     TrackMatch,
+    _parse_album_selection,
     artist_matches,
     classify_error,
     normalize_artist,
+    pick_albums,
     redact_url,
     safe_snippet,
     sanitize_filename,
@@ -212,6 +214,126 @@ class TestAlbumMatch:
     def test_inferred_type_default(self):
         album = AlbumMatch(title="Album", artists=["A"], tracks=[])
         assert album.inferred_type == "Album"
+
+
+# ─── Album selection parser tests ───
+
+
+class TestParseAlbumSelection:
+    """Pure-function tests for the multi-select album input parser."""
+
+    def test_cancel_with_zero(self):
+        assert _parse_album_selection("0", 5) is None
+
+    def test_cancel_with_empty(self):
+        assert _parse_album_selection("", 5) is None
+        assert _parse_album_selection("   ", 5) is None
+
+    def test_cancel_with_quit_keyword(self):
+        assert _parse_album_selection("q", 5) is None
+        assert _parse_album_selection("quit", 5) is None
+        assert _parse_album_selection("cancel", 5) is None
+
+    def test_all_keyword(self):
+        assert _parse_album_selection("all", 4) == [1, 2, 3, 4]
+
+    def test_asterisk_means_all(self):
+        assert _parse_album_selection("*", 3) == [1, 2, 3]
+
+    def test_short_a_means_all(self):
+        # "a" is a common alias for "all"
+        assert _parse_album_selection("a", 2) == [1, 2]
+
+    def test_single_number(self):
+        assert _parse_album_selection("3", 5) == [3]
+
+    def test_comma_separated(self):
+        assert _parse_album_selection("1,3,5", 5) == [1, 3, 5]
+
+    def test_whitespace_separated(self):
+        assert _parse_album_selection("1 3 5", 5) == [1, 3, 5]
+
+    def test_mixed_separators(self):
+        assert _parse_album_selection("1, 3 5", 5) == [1, 3, 5]
+
+    def test_range(self):
+        assert _parse_album_selection("1-3", 5) == [1, 2, 3]
+
+    def test_range_reversed_is_accepted(self):
+        assert _parse_album_selection("3-1", 5) == [1, 2, 3]
+
+    def test_range_mixed_with_list(self):
+        assert _parse_album_selection("1,3-5", 5) == [1, 3, 4, 5]
+
+    def test_dedup_and_sort(self):
+        # Duplicates collapse; result is sorted ascending.
+        assert _parse_album_selection("5,1,3,1", 5) == [1, 3, 5]
+
+    def test_case_insensitive(self):
+        assert _parse_album_selection("ALL", 3) == [1, 2, 3]
+        assert _parse_album_selection("  Q  ", 3) is None
+
+    def test_out_of_range_raises(self):
+        with pytest.raises(ValueError, match="out of range"):
+            _parse_album_selection("6", 5)
+        with pytest.raises(ValueError, match="out of range"):
+            _parse_album_selection("2-6", 5)
+
+    def test_non_numeric_raises(self):
+        with pytest.raises(ValueError, match="not a number"):
+            _parse_album_selection("foo", 5)
+        with pytest.raises(ValueError, match="not a number"):
+            _parse_album_selection("1-bar", 5)
+
+    def test_empty_total_short_circuits(self):
+        assert _parse_album_selection("1", 0) is None
+        assert _parse_album_selection("all", 0) is None
+
+
+class TestPickAlbums:
+    """Integration-style tests for the interactive picker (prompt is mocked)."""
+
+    def _make_albums(self, n: int) -> list[AlbumMatch]:
+        return [
+            AlbumMatch(
+                title=f"Album {i}",
+                artists=[f"Artist {i}"],
+                tracks=[],
+            )
+            for i in range(1, n + 1)
+        ]
+
+    def test_returns_selected_albums(self):
+        albums = self._make_albums(4)
+        with patch("monochrome_cli.Prompt.ask", return_value="1,3"):
+            selected = pick_albums(albums)
+        assert [a.title for a in selected] == ["Album 1", "Album 3"]
+
+    def test_all_keyword_returns_everything(self):
+        albums = self._make_albums(3)
+        with patch("monochrome_cli.Prompt.ask", return_value="all"):
+            selected = pick_albums(albums)
+        assert [a.title for a in selected] == ["Album 1", "Album 2", "Album 3"]
+
+    def test_cancel_returns_empty(self):
+        albums = self._make_albums(2)
+        with patch("monochrome_cli.Prompt.ask", return_value="0"):
+            assert pick_albums(albums) == []
+
+    def test_empty_list_returns_empty_without_prompt(self):
+        with patch("monochrome_cli.Prompt.ask") as mock_prompt:
+            assert pick_albums([]) == []
+        mock_prompt.assert_not_called()
+
+    def test_reprompts_on_invalid_then_accepts(self):
+        albums = self._make_albums(3)
+        # First call: invalid (out of range). Second call: valid.
+        with patch(
+            "monochrome_cli.Prompt.ask",
+            side_effect=["99", "1,2"],
+        ):
+            selected = pick_albums(albums)
+        assert [a.title for a in selected] == ["Album 1", "Album 2"]
 
 
 # ─── MonochromeClient tests ───
