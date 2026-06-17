@@ -18,13 +18,19 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 from monochrome_cli import (
     AlbumMatch,
+    EXT_FOR_FORMAT,
     MirrorError,
     MirrorStats,
     MonochromeClient,
     TrackMatch,
+    _detect_format_from_bytes,
+    _detect_format_from_content_type,
+    _existing_audio,
     _parse_album_selection,
     artist_matches,
     classify_error,
+    download_file,
+    fix_extensions,
     normalize_artist,
     pick_albums,
     redact_url,
@@ -334,6 +340,300 @@ class TestPickAlbums:
         ):
             selected = pick_albums(albums)
         assert [a.title for a in selected] == ["Album 1", "Album 2"]
+
+
+# ─── Format detection & fix-extensions tests ───
+
+
+class TestDetectFormatFromContentType:
+    def test_flac_variants(self):
+        for ct in ("audio/flac", "audio/x-flac", "application/flac", "flac"):
+            assert _detect_format_from_content_type(ct) == "flac", ct
+
+    def test_m4a_variants(self):
+        for ct in ("audio/mp4", "audio/m4a", "audio/x-m4a", "audio/aac"):
+            assert _detect_format_from_content_type(ct) == "m4a", ct
+
+    def test_mp3_variants(self):
+        for ct in ("audio/mpeg", "audio/mp3", "audio/x-mp3"):
+            assert _detect_format_from_content_type(ct) == "mp3", ct
+
+    def test_strips_charset(self):
+        assert _detect_format_from_content_type("audio/flac; charset=binary") == "flac"
+        assert _detect_format_from_content_type("audio/mp4;codecs=mp4a.40.2") == "m4a"
+
+    def test_case_insensitive(self):
+        assert _detect_format_from_content_type("AUDIO/FLAC") == "flac"
+        assert _detect_format_from_content_type("Audio/MP4") == "m4a"
+
+    def test_octet_stream_returns_none(self):
+        assert _detect_format_from_content_type("application/octet-stream") is None
+
+    def test_empty_or_none(self):
+        assert _detect_format_from_content_type("") is None
+        assert _detect_format_from_content_type(None) is None
+
+
+class TestDetectFormatFromBytes:
+    def test_flac_magic(self):
+        body = b"fLaC" + b"\x00" * 12
+        assert _detect_format_from_bytes(body) == "flac"
+
+    def test_m4a_ftyp_box(self):
+        # 4 bytes size + "ftyp" + minor brand
+        body = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 6
+        assert _detect_format_from_bytes(body) == "m4a"
+
+    def test_m4a_ftyp_with_dash(self):
+        # Some encoders use minor brand like "isom" — still detect as m4a.
+        body = b"\x00\x00\x00\x20" + b"ftyp" + b"isom" + b"\x00" * 6
+        assert _detect_format_from_bytes(body) == "m4a"
+
+    def test_mp3_id3_tag(self):
+        body = b"ID3\x03\x00\x00\x00" + b"\x00" * 6
+        assert _detect_format_from_bytes(body) == "mp3"
+
+    def test_mp3_frame_sync(self):
+        body = b"\xff\xfb\x90\x00" + b"\x00" * 12
+        assert _detect_format_from_bytes(body) == "mp3"
+
+    def test_mp3_frame_sync_alt(self):
+        # 0xFF + (0xE0 mask) = 0xE0..0xFF
+        body = b"\xff\xe0\x44\x00" + b"\x00" * 12
+        assert _detect_format_from_bytes(body) == "mp3"
+
+    def test_unrecognized(self):
+        assert _detect_format_from_bytes(b"\x00\x00\x00\x00" + b"random") is None
+        assert _detect_format_from_bytes(b"OggS") is None
+
+    def test_short_known_magic(self):
+        # Even if fewer than 16 bytes, known magic still matches.
+        assert _detect_format_from_bytes(b"fLaC") == "flac"
+        assert _detect_format_from_bytes(b"\x00\x00\x00\x20ftyp") == "m4a"
+        assert _detect_format_from_bytes(b"ID3") == "mp3"
+        assert _detect_format_from_bytes(b"\xff\xfb") == "mp3"
+
+    def test_empty(self):
+        assert _detect_format_from_bytes(b"") is None
+
+
+class TestExistingAudio:
+    def test_finds_flac(self, tmp_path):
+        base = tmp_path / "Artist - Title"
+        (tmp_path / "Artist - Title.flac").write_bytes(b"fLaC")
+        assert _existing_audio(base) == base.with_suffix(".flac")
+
+    def test_finds_m4a(self, tmp_path):
+        base = tmp_path / "Artist - Title"
+        (tmp_path / "Artist - Title.m4a").write_bytes(b"\x00\x00\x00\x20ftypM4A ")
+        assert _existing_audio(base) == base.with_suffix(".m4a")
+
+    def test_finds_mp3(self, tmp_path):
+        base = tmp_path / "Artist - Title"
+        (tmp_path / "Artist - Title.mp3").write_bytes(b"ID3\x03\x00\x00\x00")
+        assert _existing_audio(base) == base.with_suffix(".mp3")
+
+    def test_returns_none_when_missing(self, tmp_path):
+        base = tmp_path / "Artist - Title"
+        assert _existing_audio(base) is None
+
+    def test_prefers_flac(self, tmp_path):
+        # If somehow multiple exist, any match returns — we just want a hit.
+        base = tmp_path / "Artist - Title"
+        (tmp_path / "Artist - Title.flac").write_bytes(b"fLaC")
+        (tmp_path / "Artist - Title.m4a").write_bytes(b"x")
+        result = _existing_audio(base)
+        assert result is not None
+        assert result.suffix in {".flac", ".m4a"}
+
+
+def _make_response(content_type: str, body: bytes, content_length: int | None = None):
+    """Build a stub requests.Response with the given headers and iterable body."""
+    resp = MagicMock()
+    resp.headers = {"Content-Type": content_type}
+    if content_length is not None:
+        resp.headers["content-length"] = str(content_length)
+    resp.raise_for_status = MagicMock()
+
+    def _iter(chunk_size: int = 8192):
+        for i in range(0, len(body), chunk_size):
+            yield body[i:i + chunk_size]
+
+    resp.iter_content = _iter
+    resp.close = MagicMock()
+    return resp
+
+
+class TestDownloadFile:
+    def test_writes_flac_when_content_type_says_flac(self, tmp_path):
+        body = b"fLaC" + b"\x00" * 4096
+        resp = _make_response("audio/flac", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            base = tmp_path / "Artist - Title"
+            out = download_file("http://x/stream", base, MagicMock(), 0)
+        assert out == base.with_suffix(".flac")
+        assert out.exists()
+        assert out.read_bytes() == body
+        # No stray .tmp files
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_writes_m4a_when_content_type_says_mp4(self, tmp_path):
+        body = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 100
+        resp = _make_response("audio/mp4", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            base = tmp_path / "Artist - Title"
+            out = download_file("http://x/stream", base, MagicMock(), 0)
+        assert out.suffix == ".m4a"
+        assert out.read_bytes() == body
+
+    def test_magic_bytes_win_over_octet_stream(self, tmp_path):
+        # Server declares octet-stream but body is real flac → .flac
+        body = b"fLaC" + b"\x00" * 200
+        resp = _make_response("application/octet-stream", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            base = tmp_path / "track"
+            out = download_file("http://x", base, MagicMock(), 0)
+        assert out.suffix == ".flac"
+
+    def test_lying_content_type_corrected_by_magic(self, tmp_path):
+        # Header says flac, body is actually m4a → file ends up .m4a
+        body = b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 200
+        resp = _make_response("audio/flac", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            base = tmp_path / "track"
+            out = download_file("http://x", base, MagicMock(), 0)
+        assert out.suffix == ".m4a"
+
+    def test_does_not_overwrite_existing_final_file(self, tmp_path):
+        # If something already exists at the target path, the function should
+        # return that path and NOT clobber the existing file.
+        base = tmp_path / "track"
+        final = base.with_suffix(".flac")
+        final.write_bytes(b"PRE-EXISTING")
+        body = b"fLaC" + b"\x00" * 64
+        resp = _make_response("audio/flac", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            out = download_file("http://x", base, MagicMock(), 0)
+        assert out == final
+        assert out.read_bytes() == b"PRE-EXISTING"
+        # No leftover .tmp
+        assert list(tmp_path.glob("*.tmp")) == []
+
+    def test_cleans_up_tmp_on_http_error(self, tmp_path):
+        resp = MagicMock()
+        resp.headers = {"Content-Type": "audio/flac"}
+        resp.raise_for_status = MagicMock(side_effect=Exception("HTTP 500"))
+        resp.iter_content = MagicMock(return_value=iter([b"fLaC" + b"\x00" * 100]))
+        resp.close = MagicMock()
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            with pytest.raises(Exception, match="HTTP 500"):
+                download_file("http://x", tmp_path / "track", MagicMock(), 0)
+        # Temp files should be gone (none opened, but also nothing dangling).
+        assert list(tmp_path.glob("*.tmp")) == []
+        # No file with one of the supported extensions should exist either.
+        for ext in EXT_FOR_FORMAT.values():
+            assert not (tmp_path / f"track{ext}").exists()
+
+    def test_empty_body_raises(self, tmp_path):
+        resp = _make_response("audio/flac", b"", content_length=0)
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            with pytest.raises(RuntimeError, match="empty response body"):
+                download_file("http://x", tmp_path / "track", MagicMock(), 0)
+        assert list(tmp_path.iterdir()) == []
+
+    def test_progress_updated_with_total_and_chunks(self, tmp_path):
+        body = b"fLaC" + b"\x00" * 200
+        progress = MagicMock()
+        resp = _make_response("audio/flac", body, content_length=len(body))
+        with patch("monochrome_cli.requests.get", return_value=resp):
+            download_file("http://x", tmp_path / "track", progress, 0)
+        # Total should have been set to the content-length.
+        total_calls = [
+            c for c in progress.update.call_args_list
+            if c.kwargs.get("total") == len(body)
+        ]
+        assert total_calls
+        # At least one advance call.
+        advance_calls = [
+            c for c in progress.update.call_args_list
+            if c.kwargs.get("advance")
+        ]
+        assert advance_calls
+
+
+class TestFixExtensions:
+    def test_renames_m4a_to_flac_extension(self, tmp_path):
+        bad = tmp_path / "Pizza Hotline - AIR.flac"
+        bad.write_bytes(b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 200)
+        renamed, scanned = fix_extensions(tmp_path)
+        assert scanned == 1
+        assert renamed == 1
+        assert not bad.exists()
+        good = tmp_path / "Pizza Hotline - AIR.m4a"
+        assert good.exists()
+        assert good.read_bytes()[:4] == b"\x00\x00\x00\x20"
+
+    def test_leaves_correctly_named_file_alone(self, tmp_path):
+        ok = tmp_path / "Real Flac.flac"
+        ok.write_bytes(b"fLaC" + b"\x00" * 100)
+        renamed, scanned = fix_extensions(tmp_path)
+        assert scanned == 1
+        assert renamed == 0
+        assert ok.exists()
+
+    def test_leaves_non_audio_alone(self, tmp_path):
+        # Random text file with .flac extension → not detected, left as-is.
+        bad = tmp_path / "readme.flac"
+        bad.write_text("not really audio")
+        renamed, scanned = fix_extensions(tmp_path)
+        assert scanned == 1
+        assert renamed == 0
+        assert bad.exists()
+
+    def test_handles_mixed_directory(self, tmp_path):
+        # Three real files in three different states plus a subdir.
+        sub = tmp_path / "sub"
+        sub.mkdir()
+
+        m4a_misnamed = tmp_path / "track1.flac"
+        m4a_misnamed.write_bytes(b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 50)
+
+        flac_correct = tmp_path / "track2.flac"
+        flac_correct.write_bytes(b"fLaC" + b"\x00" * 50)
+
+        mp3_misnamed = sub / "song1.flac"
+        mp3_misnamed.write_bytes(b"ID3\x03\x00\x00\x00" + b"\x00" * 50)
+
+        text_file = tmp_path / "notes.txt"
+        text_file.write_text("hello")
+
+        renamed, scanned = fix_extensions(tmp_path)
+        assert scanned == 4
+        assert renamed == 2
+        assert not m4a_misnamed.exists()
+        assert (tmp_path / "track1.m4a").exists()
+        assert flac_correct.exists()
+        assert not mp3_misnamed.exists()
+        assert (sub / "song1.mp3").exists()
+        assert text_file.exists()
+
+    def test_target_already_exists_skipped(self, tmp_path):
+        # Both .flac and .m4a exist for the same stem; can't rename, leave it.
+        flac = tmp_path / "track.flac"
+        m4a = tmp_path / "track.m4a"
+        flac.write_bytes(b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 50)
+        m4a.write_bytes(b"\x00\x00\x00\x20" + b"ftyp" + b"M4A " + b"\x00" * 50)
+        renamed, scanned = fix_extensions(tmp_path)
+        assert scanned == 2
+        assert renamed == 0
+        # Original misnamed file remains.
+        assert flac.exists()
+        assert m4a.exists()
+
+    def test_empty_directory(self, tmp_path):
+        renamed, scanned = fix_extensions(tmp_path)
+        assert renamed == 0
+        assert scanned == 0
 
 
 # ─── MonochromeClient tests ───

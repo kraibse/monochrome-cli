@@ -693,17 +693,205 @@ class MonochromeClient:
                 console.print(f"  [dim]API detail: {str(detail)[:150]}[/dim]")
 
 
-def download_file(url: str, dest: Path, progress: Progress, task_id: int, chunk_size: int = 8192) -> None:
+# Map of internal format names to the on-disk file extension we use for them.
+EXT_FOR_FORMAT: dict[str, str] = {
+    "flac": ".flac",
+    "m4a":  ".m4a",
+    "mp3":  ".mp3",
+}
+
+
+def _detect_format_from_content_type(content_type: str | None) -> str | None:
+    """Return the audio format implied by an HTTP ``Content-Type`` header.
+
+    Returns one of ``"flac"``, ``"m4a"``, ``"mp3"``, or ``None`` when the header
+    is missing or does not point at a known audio container.
+    """
+    if not content_type:
+        return None
+    ct = content_type.lower().split(";", 1)[0].strip()
+    if ct in {"audio/flac", "audio/x-flac", "application/flac", "flac"}:
+        return "flac"
+    if ct in {"audio/mp4", "audio/m4a", "audio/x-m4a", "audio/mp4a-latm",
+              "audio/aac", "audio/x-aac"}:
+        return "m4a"
+    if ct in {"audio/mpeg", "audio/mp3", "audio/mpeg3", "audio/x-mpeg", "audio/x-mp3"}:
+        return "mp3"
+    # Looser fallbacks: anything mentioning these substrings is good enough.
+    if "flac" in ct:
+        return "flac"
+    if "mp4" in ct or "m4a" in ct or "aac" in ct:
+        return "m4a"
+    if "mpeg" in ct or "mp3" in ct:
+        return "mp3"
+    return None
+
+
+def _detect_format_from_bytes(data: bytes) -> str | None:
+    """Sniff the leading bytes of an audio file.
+
+    Recognises native FLAC (``fLaC`` magic), ISO BMFF (any ``ftyp`` box —
+    treated as ``m4a`` for music downloads), and MP3 (an ``ID3`` tag or the
+    11-bit-all-ones frame sync). Returns ``None`` for unrecognised data.
+    """
+    if len(data) >= 4 and data[:4] == b"fLaC":
+        return "flac"
+    if len(data) >= 8 and data[4:8] == b"ftyp":
+        return "m4a"
+    if len(data) >= 3 and data[:3] == b"ID3":
+        return "mp3"
+    if len(data) >= 2 and data[0] == 0xFF and (data[1] & 0xE0) == 0xE0:
+        return "mp3"
+    return None
+
+
+def _existing_audio(base: Path) -> Path | None:
+    """Return an existing audio file at ``base`` under any supported extension.
+
+    ``base`` is a *stem* (no extension); we check for ``base.flac``,
+    ``base.m4a``, ``base.mp3`` and return the first hit. This is used by the
+    downloader to skip tracks that have already been saved — regardless of
+    which container the mirror served last time.
+    """
+    for ext in EXT_FOR_FORMAT.values():
+        try:
+            p = base.with_suffix(ext)
+        except OSError:
+            continue
+        try:
+            if p.exists():
+                return p
+        except OSError:
+            continue
+    return None
+
+
+def download_file(url: str, base: Path, progress: Progress, task_id: int, chunk_size: int = 8192) -> Path:
+    """Stream ``url`` to ``base.<ext>`` where ``<ext>`` is auto-detected.
+
+    The container is determined from the response's ``Content-Type`` header
+    and verified with a magic-byte sniff of the saved file. The download is
+    written atomically to a sibling ``.tmp`` file and renamed on success, so
+    a misnamed file is never left on disk.
+
+    Returns the final on-disk path (which may differ from ``base`` if a
+    different container was served). Raises on any I/O or HTTP error; partial
+    temp files are cleaned up.
+    """
+    base.parent.mkdir(parents=True, exist_ok=True)
     resp = requests.get(url, stream=True, timeout=30)
     resp.raise_for_status()
+    head_ct = _detect_format_from_content_type(resp.headers.get("Content-Type", ""))
     total = int(resp.headers.get("content-length", 0))
     if total:
         progress.update(task_id, total=total)
-    with open(dest, "wb") as f:
+
+    tmp: Path | None = None
+    head = bytearray()
+    file_obj = None
+    try:
         for chunk in resp.iter_content(chunk_size=chunk_size):
-            if chunk:
-                f.write(chunk)
-                progress.update(task_id, advance=len(chunk))
+            if not chunk:
+                continue
+            if len(head) < 16:
+                head.extend(chunk[: 16 - len(head)])
+            if file_obj is None:
+                detected = _detect_format_from_bytes(bytes(head)) or head_ct or "flac"
+                if detected not in EXT_FOR_FORMAT:
+                    detected = "flac"
+                ext = EXT_FOR_FORMAT[detected]
+                tmp = base.with_suffix(ext + ".tmp")
+                file_obj = open(tmp, "wb")
+            file_obj.write(chunk)
+            progress.update(task_id, advance=len(chunk))
+    finally:
+        if file_obj is not None:
+            try:
+                file_obj.close()
+            except OSError:
+                pass
+        try:
+            resp.close()
+        except Exception:
+            pass
+
+    if tmp is None:
+        raise RuntimeError(f"empty response body for {url}")
+
+    try:
+        with open(tmp, "rb") as fh:
+            first = fh.read(16)
+        detected = _detect_format_from_bytes(first) or head_ct or "flac"
+        if detected not in EXT_FOR_FORMAT:
+            detected = "flac"
+        final_ext = EXT_FOR_FORMAT[detected]
+        final_path = base.with_suffix(final_ext)
+
+        # A file already exists at the final path — drop the new download and
+        # report the existing one (caller treats it as a skip).
+        if final_path.exists() and final_path != tmp:
+            tmp.unlink(missing_ok=True)
+            return final_path
+
+        final_path.parent.mkdir(parents=True, exist_ok=True)
+        tmp.replace(final_path)
+        return final_path
+    except BaseException:
+        # Any failure after writing the temp file: clean it up.
+        try:
+            if tmp is not None and Path(tmp).exists():
+                Path(tmp).unlink()
+        except OSError:
+            pass
+        raise
+
+
+def fix_extensions(root: Path) -> tuple[int, int]:
+    """Walk ``root`` and rename files whose extension does not match their
+    actual container.
+
+    Sniffs the first 16 bytes of every regular file under ``root`` and, if a
+    known audio format is detected, renames the file to the matching extension
+    (``.flac``/``.m4a``/``.mp3``). Files that are already correctly named,
+    whose content is not a recognised audio format, or whose target path is
+    already occupied, are left alone. Returns ``(renamed, scanned)`` counts.
+    """
+    renamed = 0
+    scanned = 0
+    for path in sorted(root.rglob("*")):
+        try:
+            if not path.is_file():
+                continue
+        except OSError:
+            continue
+        scanned += 1
+        try:
+            with open(path, "rb") as f:
+                head = f.read(16)
+        except OSError:
+            continue
+        detected = _detect_format_from_bytes(head)
+        if not detected:
+            continue
+        expected_ext = EXT_FOR_FORMAT[detected]
+        if path.suffix.lower() == expected_ext.lower():
+            continue
+        target = path.with_suffix(expected_ext)
+        if target.exists():
+            console.print(f"[yellow][skip] {path}: target already exists ({target.name})[/yellow]")
+            continue
+        try:
+            path.rename(target)
+        except OSError as exc:
+            console.print(f"[red][skip] {path}: {exc}[/red]")
+            continue
+        renamed += 1
+        try:
+            rel = path.relative_to(root)
+        except ValueError:
+            rel = path
+        console.print(f"[dim]{rel}[/dim] → [green]{target.name}[/green]")
+    return renamed, scanned
 
 
 def pick_track(tracks: list[TrackMatch]) -> TrackMatch | None:
@@ -835,21 +1023,23 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
         console.print(f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
         return "failed"
 
-    safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}")
-    dest = output_dir / f"{safe_name}.flac"
+    raw_name = f"{', '.join(track.artists)} - {track.title}"
+    safe_name = sanitize_filename(raw_name)
+    base = output_dir / safe_name
     try:
-        if dest.exists():
+        if _existing_audio(base) is not None:
             console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
             return "skipped"
     except OSError:
         # Path too long — try progressively shorter names
         for short_len in (120, 80, 50, 30):
-            safe_name = sanitize_filename(f"{', '.join(track.artists)} - {track.title}", max_bytes=short_len)
-            dest = output_dir / f"{safe_name}.flac"
+            short_name = sanitize_filename(raw_name, max_bytes=short_len)
+            short_base = output_dir / short_name
             try:
-                if dest.exists():
+                if _existing_audio(short_base) is not None:
                     console.print(f"[yellow][skip] {track.title}: already exists[/yellow]")
                     return "skipped"
+                base = short_base
                 break
             except OSError:
                 continue
@@ -859,7 +1049,7 @@ def download_single(client: MonochromeClient, track: TrackMatch, output_dir: Pat
 
     task_id = progress.add_task(f"[cyan]{track.title}", start=True)
     try:
-        download_file(stream_url, dest, progress, task_id)
+        download_file(stream_url, base, progress, task_id)
         progress.update(task_id, description=f"[green]✓ {track.title}")
         return "downloaded"
     except KeyboardInterrupt:
@@ -1097,8 +1287,19 @@ def _main() -> int:
     parser.add_argument("--qobuz-mirrors", nargs="+", default=DEFAULT_CFG_QOBUZ_MIRRORS, help="Qobuz mirror URLs (override config)")
     parser.add_argument("--status", action="store_true", help="Check mirror availability and exit")
     parser.add_argument("--csv", type=Path, default=None, help="Path to a CSV playlist file for bulk download")
+    parser.add_argument("--fix-extensions", type=Path, default=None, metavar="DIR",
+                        help="Rename files under DIR whose extension does not match their actual audio container (FLAC/M4A/MP3) and exit")
     args = parser.parse_args()
     args.output = Path(os.path.expanduser(str(args.output)))
+
+    if args.fix_extensions is not None:
+        root = Path(os.path.expanduser(str(args.fix_extensions)))
+        if not root.is_dir():
+            console.print(f"[red]Not a directory: {root}[/red]")
+            return 1
+        renamed, scanned = fix_extensions(root)
+        console.print(f"[bold green]Scanned {scanned} file(s); renamed {renamed}.[/bold green]")
+        return 0
 
     client = MonochromeClient(
         base_urls=args.mirrors,

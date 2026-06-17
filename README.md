@@ -60,6 +60,7 @@ python monochrome_cli.py -d --no-strict "artist name"
 | `--qobuz-mirrors` | Additional Qobuz mirror URLs (merged with defaults) |
 | `--status` | Check availability of all configured mirrors and exit |
 | `--csv` | Path to a CSV playlist file for bulk download |
+| `--fix-extensions DIR` | Walk DIR and rename files whose extension does not match their actual audio container (FLAC / M4A / MP3) |
 
 ### Examples
 
@@ -78,6 +79,9 @@ python monochrome_cli.py --status
 
 # Bulk download from a CSV playlist
 python monochrome_cli.py --csv playlist.csv
+
+# Rename misnamed files (e.g. .flac files that are actually M4A) in a folder
+python monochrome_cli.py --fix-extensions ~/Music
 ```
 
 ### CSV Playlists
@@ -106,6 +110,28 @@ The tool reads `Track Name` and `Artist Name(s)` columns, searches each track, a
 - Missing data (CSV rows with empty fields)
 
 Rows missing either column are skipped. If a track can't be found, it's logged and the script continues with the next row.
+
+### Format Detection & Fix-Extensions
+
+Some mirrors (especially at `LOW` quality, but occasionally at `HIGH`) return **M4A (ISO BMFF)** audio even when the file was requested as FLAC. Previously the CLI would save those bytes as `.flac`, which made tools like `file(1)` report `ISO Media, MP4 Base Media v1` for a `.flac` file.
+
+The downloader now auto-detects the real container from the response's `Content-Type` header and a magic-byte sniff of the saved bytes, and writes the file with the matching extension. Recognised formats:
+
+| Format | Extensions | Magic bytes | Common Content-Types |
+|--------|------------|-------------|----------------------|
+| FLAC   | `.flac`    | `fLaC` (offset 0)            | `audio/flac`, `audio/x-flac` |
+| M4A    | `.m4a`     | `ftyp` box (offset 4)        | `audio/mp4`, `audio/m4a`, `audio/aac` |
+| MP3    | `.mp3`     | `ID3` tag or `0xFFEx` sync   | `audio/mpeg`, `audio/mp3` |
+
+The file is written to `Artist - Title.<ext>.tmp` and atomically renamed once the format is confirmed — a misnamed file is never left on disk.
+
+**Migrating an existing library.** If you already have a directory of `.flac` files that are actually M4A, run the migration walker to rename them in place:
+
+```bash
+python monochrome_cli.py --fix-extensions ~/Music
+```
+
+It scans every regular file under the directory, sniffs the first 16 bytes, and renames mismatches (e.g. `Pizza Hotline - AIR.flac` → `Pizza Hotline - AIR.m4a`). It skips non-audio files, already-correctly-named files, and any case where the target path is already occupied. The exit status is 0 either way; a summary of scanned / renamed counts is printed at the end.
 
 ## Configuration
 
