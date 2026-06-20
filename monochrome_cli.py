@@ -1689,7 +1689,11 @@ def _main() -> int:
                 TimeRemainingColumn(),
                 console=console,
             ) as progress:
-                status = download_single(client, track, out, progress)
+                task_id = progress.add_task(
+                    f"{', '.join(track.artists) or 'Unknown'} - {track.title}",
+                    total=None,
+                )
+                status = download_single(client, track, out, progress, task_id)
                 if status == "skipped":
                     console.print("[yellow]Track already exists — skipped.[/yellow]")
                 elif status == "failed":

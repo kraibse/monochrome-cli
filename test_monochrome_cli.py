@@ -40,6 +40,7 @@ from monochrome_cli import (
     _existing_audio,
     _parse_album_selection,
     _parse_key_bytes,
+    _main,
     _read_one_key,
     _resolve_default_quality,
     _select_albums_with_keys,
@@ -779,6 +780,49 @@ class TestDownloadSingleStatusLog:
         )
         assert status == "skipped"
         assert any("already exists" in m for m in log)
+
+
+class TestMainSingleTrackPath:
+    """Regression: the single-track CLI branch must pass ``task_id`` to
+    ``download_single``. Previously it omitted the argument, raising
+    ``TypeError: download_single() missing 1 required positional argument: 'task_id'``.
+    """
+
+    def _track(self) -> TrackMatch:
+        return TrackMatch(
+            title="Song",
+            artists=["Artist"],
+            tidal_id=1,
+            isrc=None,
+            album="Album",
+            duration_sec=180,
+            quality="HIGH",
+        )
+
+    def test_download_single_receives_task_id(self, tmp_path):
+        track = self._track()
+        client = MagicMock()
+        client.search.return_value = ([track], None)
+
+        with patch("monochrome_cli.MonochromeClient", return_value=client), \
+             patch("monochrome_cli.select_tracks", return_value=[track]), \
+             patch("monochrome_cli.download_single", return_value="downloaded") as mock_dl, \
+             patch("monochrome_cli.Progress") as mock_progress_cls, \
+             patch("sys.argv", [
+                 "monochrome_cli.py", "--no-tui",
+                 "-o", str(tmp_path), "query",
+             ]):
+            progress_cm = mock_progress_cls.return_value.__enter__.return_value
+            progress_cm.add_task.return_value = 42
+            rc = _main()
+
+        assert rc == 0
+        mock_dl.assert_called_once()
+        args, _kwargs = mock_dl.call_args
+        # Positional signature: (client, track, output_dir, progress, task_id)
+        assert len(args) >= 5
+        assert args[4] == 42  # task_id must be the id returned by add_task
+        progress_cm.add_task.assert_called_once()
 
 
 class TestDownloadDiscography:
