@@ -46,6 +46,7 @@ from monochrome_cli import (
     _select_albums_with_keys,
     artist_matches,
     classify_error,
+    download_album,
     download_albums,
     download_discography,
     download_file,
@@ -1923,6 +1924,205 @@ class TestSelectFallback:
              patch("monochrome_cli.IntPrompt.ask", return_value=1):
             result = select_tracks(tracks, force_tui=True)
         assert [t.title for t in result] == ["Title 0"]
+
+
+# ─── Parallelism & prefetch tests ───
+
+
+class TestSearchParallelism:
+    """New parallel fan-out behaviour for search and album resolution."""
+
+    def _track_item(self, tid: int, title: str = "Song") -> dict:
+        return {
+            "id": tid,
+            "title": title,
+            "artists": [{"name": "Artist"}],
+            "album": {"title": "Album"},
+            "duration": 180,
+            "audioQuality": "HIGH",
+        }
+
+    def test_paginated_search_queries_all_mirrors_in_parallel(self):
+        client = MonochromeClient(base_urls=["https://a.com", "https://b.com"])
+
+        def fake_get(url: str, **kwargs):
+            resp = MagicMock()
+            resp.ok = True
+            resp.headers = {"Content-Type": "application/json"}
+            if url.startswith("https://a.com"):
+                resp.json.return_value = {"data": {"items": [self._track_item(1), self._track_item(2)]}}
+            else:
+                resp.json.return_value = {"data": {"items": [self._track_item(2), self._track_item(3)]}}
+            return resp
+
+        with patch.object(client.session, "get", side_effect=fake_get):
+            results = client.search_paginated("test", max_pages=1)
+
+        ids = {t.tidal_id for t in results}
+        assert ids == {1, 2, 3}
+        assert len(results) == 3
+
+    def test_search_albums_resolves_full_tracks_in_parallel(self):
+        client = MonochromeClient(base_urls=["https://mono.com"])
+        # Two albums from the initial search.
+        tracks = [
+            TrackMatch(tidal_id=10, title="A1T1", artists=["Artist"], album="Album 1", album_id=101, duration_sec=180, quality="HIGH"),
+            TrackMatch(tidal_id=20, title="A2T1", artists=["Artist"], album="Album 2", album_id=202, duration_sec=180, quality="HIGH"),
+        ]
+        client.search = MagicMock(return_value=(tracks, "https://mono.com"))
+
+        def fake_get_album_tracks(album_id: int):
+            return (
+                [TrackMatch(tidal_id=album_id + 1, title=f"Track {album_id}", artists=["Artist"], album=f"Album {album_id}", duration_sec=180, quality="HIGH")],
+                "ALBUM",
+                ["Artist"],
+            )
+
+        with patch.object(client, "get_album_tracks", side_effect=fake_get_album_tracks) as mock_tracks:
+            albums = client.search_albums("test")
+
+        assert len(albums) == 2
+        # Parallel resolver should have fetched both albums.
+        assert mock_tracks.call_count == 2
+        assert {a.tracks[0].tidal_id for a in albums} == {102, 203}
+
+    def test_search_discography_resolves_full_tracks_in_parallel_and_filters(self):
+        client = MonochromeClient(base_urls=["https://mono.com"])
+        tracks = [
+            TrackMatch(tidal_id=1, title="Hit", artists=["Daft Punk"], album="Discovery", album_id=11, duration_sec=180, quality="HIGH"),
+            TrackMatch(tidal_id=2, title="Feat", artists=["Other"], album="Discovery", album_id=11, duration_sec=180, quality="HIGH"),
+        ]
+        client.search_paginated = MagicMock(return_value=tracks)
+
+        def fake_get_album_tracks(album_id: int):
+            return (
+                [
+                    TrackMatch(tidal_id=1, title="Hit", artists=["Daft Punk"], album="Discovery", album_id=11, duration_sec=180, quality="HIGH"),
+                    TrackMatch(tidal_id=2, title="Feat", artists=["Other"], album="Discovery", album_id=11, duration_sec=180, quality="HIGH"),
+                ],
+                "ALBUM",
+                ["Various Artists"],
+            )
+
+        with patch.object(client, "get_album_tracks", side_effect=fake_get_album_tracks) as mock_tracks:
+            albums = client.search_discography("Daft Punk", strict=True)
+
+        assert len(albums) == 1
+        assert mock_tracks.call_count == 1
+        album = albums[0]
+        # Strict mode on a VA/compilation album keeps only tracks whose artists match.
+        assert [t.tidal_id for t in album.tracks] == [1]
+
+
+class TestDownloadPrefetch:
+    """Per-album stream-URL prefetching and prefetched download_single args."""
+
+    def _track(self, tid: int = 1, title: str = "Song") -> TrackMatch:
+        return TrackMatch(
+            tidal_id=tid,
+            title=title,
+            artists=["Artist"],
+            album="Album",
+            duration_sec=180,
+            quality="HIGH",
+        )
+
+    def _album(self, n: int) -> AlbumMatch:
+        tracks = [self._track(tid=i, title=f"Track {i}") for i in range(n)]
+        return AlbumMatch(title="Album", artists=["Artist"], tracks=tracks)
+
+    def _noop_status(self):
+        return patch("monochrome_cli.console.status", return_value=MagicMock(__enter__=MagicMock(return_value=MagicMock()), __exit__=MagicMock(return_value=False)))
+
+    def test_download_single_uses_prefetched_stream_url(self, tmp_path):
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        client.get_stream_url = MagicMock(side_effect=RuntimeError("should not be called"))
+        track = self._track()
+        progress = MagicMock()
+
+        with patch("monochrome_cli.download_file"):
+            status = download_single(
+                client, track, tmp_path, progress, task_id=0,
+                prefetched_stream_url="http://prefetched/stream.flac",
+            )
+
+        assert status == "downloaded"
+        client.get_stream_url.assert_not_called()
+
+    def test_download_single_prefetched_error_logs_failure(self, tmp_path):
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        track = self._track()
+        progress = MagicMock()
+        log: list[str] = []
+
+        with patch("monochrome_cli.console.print") as mock_print:
+            status = download_single(
+                client, track, tmp_path, progress, task_id=0,
+                status_log=log,
+                prefetched_error=RuntimeError("prefetch failed"),
+            )
+
+        assert status == "failed"
+        assert len(log) == 1
+        assert "prefetch failed" in log[0]
+        mock_print.assert_not_called()
+
+    def test_download_album_prefetches_stream_urls(self, tmp_path):
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        album = self._album(2)
+        prefetched = {
+            0: "http://x/0.flac",
+            1: "http://x/1.flac",
+        }
+
+        with self._noop_status(), \
+             patch("monochrome_cli._prefetch_stream_urls", return_value=prefetched) as mock_prefetch, \
+             patch("monochrome_cli.download_file") as mock_download:
+            result = download_album(client, album, tmp_path)
+
+        assert result == 2
+        mock_prefetch.assert_called_once_with(client, album.tracks, status_log=[])
+        assert client.get_stream_url.call_count == 0
+        # download_file should have received the prefetched stream URLs.
+        urls = {call.args[0] for call in mock_download.call_args_list}
+        assert urls == {"http://x/0.flac", "http://x/1.flac"}
+
+    def test_download_album_handles_prefetch_failure(self, tmp_path):
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        album = self._album(2)
+        prefetched = {
+            0: "http://x/0.flac",
+            1: RuntimeError("expired"),
+        }
+
+        with self._noop_status(), \
+             patch("monochrome_cli._prefetch_stream_urls", return_value=prefetched), \
+             patch("monochrome_cli.download_file") as mock_download:
+            result = download_album(client, album, tmp_path)
+
+        assert result == 1
+        # One success, one failure call.
+        assert mock_download.call_count == 1
+        failed = [call for call in mock_download.call_args_list if call.kwargs.get("prefetched_error") is not None]
+        assert len(failed) == 0  # failures never reach download_file
+
+    def test_download_album_falls_back_without_prefetch(self, tmp_path):
+        client = MagicMock(spec=MonochromeClient)
+        client.quality = "HIGH"
+        client.get_stream_url.return_value = "http://x/fallback.flac"
+        album = self._album(1)
+
+        with self._noop_status(), \
+             patch("monochrome_cli._prefetch_stream_urls", return_value={}), \
+             patch("monochrome_cli.download_file"):
+            result = download_album(client, album, tmp_path)
+
+        assert result == 1
+        client.get_stream_url.assert_called_once()
 
 
 # ─── Run if executed directly ───

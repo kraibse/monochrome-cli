@@ -11,6 +11,7 @@ import json
 import os
 import select
 import sys
+import threading
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -63,6 +64,10 @@ DEFAULT_QOBUZ_MIRRORS = [
 DEFAULT_QUALITY = "HIGH"
 STATS_PATH = Path("mirror-stats.json")
 
+# Worker caps for parallel network fetches.
+ALBUM_FETCH_WORKERS = 8
+STREAM_PREFETCH_WORKERS = 6
+
 
 def _load_config() -> dict[str, Any]:
     cfg_paths = [
@@ -109,6 +114,7 @@ class MirrorStats:
         self.path = path
         self.stats: dict[str, dict[str, int]] = {}
         self._pending = False
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self) -> None:
@@ -128,13 +134,14 @@ class MirrorStats:
         self._pending = False
 
     def record(self, mirror: str, success: bool) -> None:
-        s = self.stats.setdefault(mirror, {"ok": 0, "total": 0})
-        s["total"] += 1
-        if success:
-            s["ok"] += 1
-        if not self._pending:
-            self._pending = True
-            self._save()
+        with self._lock:
+            s = self.stats.setdefault(mirror, {"ok": 0, "total": 0})
+            s["total"] += 1
+            if success:
+                s["ok"] += 1
+            if not self._pending:
+                self._pending = True
+                self._save()
 
     def success_rate(self, mirror: str) -> float:
         s = self.stats.get(mirror)
@@ -341,7 +348,7 @@ class MonochromeClient:
             nonlocal used_mirror
             url = f"{base}{path}"
             try:
-                resp = self.session.get(url, timeout=15)
+                resp = self.session.get(url, timeout=(6, 15))
             except Exception as exc:
                 self.stats.record(base, False)
                 cat, detail = classify_error(exc)
@@ -416,69 +423,87 @@ class MonochromeClient:
             return [], None
         results: list[TrackMatch] = []
         for item in items:
-            cover = item.get("album", {}).get("cover") or item.get("cover")
-            album_art = None
-            if isinstance(cover, str) and cover:
-                album_art = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/320x320.jpg"
-            results.append(
-                TrackMatch(
-                    tidal_id=item["id"],
-                    title=item.get("title", "Unknown"),
-                    artists=[a.get("name", "Unknown") for a in item.get("artists", [])]
-                    or ([item.get("artist", {}).get("name")] if item.get("artist", {}).get("name") else []),
-                    album=item.get("album", {}).get("title", "Unknown"),
-                    duration_sec=item.get("duration", 0),
-                    quality=item.get("audioQuality", "UNKNOWN"),
-                    isrc=item.get("isrc") if isinstance(item.get("isrc"), str) else None,
-                    album_art_url=album_art,
-                    album_type=item.get("album", {}).get("type"),
-                    album_id=item.get("album", {}).get("id"),
-                )
-            )
+            track = self._parse_track_item(item)
+            if track is not None:
+                results.append(track)
         return results, used_mirror
+
+    def _parse_track_item(self, item: dict[str, Any]) -> TrackMatch | None:
+        """Build a TrackMatch from a raw API track item, or None if invalid."""
+        if not isinstance(item, dict) or "id" not in item:
+            return None
+        cover = item.get("album", {}).get("cover") or item.get("cover")
+        album_art = None
+        if isinstance(cover, str) and cover:
+            album_art = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/320x320.jpg"
+        return TrackMatch(
+            tidal_id=item["id"],
+            title=item.get("title", "Unknown"),
+            artists=[a.get("name", "Unknown") for a in item.get("artists", [])]
+            or ([item.get("artist", {}).get("name")] if item.get("artist", {}).get("name") else []),
+            album=item.get("album", {}).get("title", "Unknown"),
+            duration_sec=item.get("duration", 0),
+            quality=item.get("audioQuality", "UNKNOWN"),
+            isrc=item.get("isrc") if isinstance(item.get("isrc"), str) else None,
+            album_art_url=album_art,
+            album_type=item.get("album", {}).get("type"),
+            album_id=item.get("album", {}).get("id"),
+        )
+
+    def _fetch_search_page(
+        self, query: str, limit: int, offset: int
+    ) -> dict[int, TrackMatch]:
+        """Query all configured mirrors for a single page in parallel.
+
+        Returns a dict of tidal_id -> TrackMatch merged from the first mirror
+        to respond on each track ID; later mirrors only fill in missing IDs.
+        """
+        page_tracks: dict[int, TrackMatch] = {}
+
+        def try_mirror(base: str) -> dict[int, TrackMatch]:
+            found: dict[int, TrackMatch] = {}
+            try:
+                resp = self.session.get(
+                    f"{base}/search/?s={quote(query)}&limit={limit}&offset={offset}",
+                    timeout=(6, 15),
+                )
+                if not resp.ok:
+                    return found
+                data = resp.json()
+                items = data.get("data", {}).get("items", [])
+                if not isinstance(items, list):
+                    return found
+                for item in items:
+                    track = self._parse_track_item(item)
+                    if track is None:
+                        continue
+                    if track.tidal_id not in found:
+                        found[track.tidal_id] = track
+            except Exception:
+                pass
+            return found
+
+        if not self.base_urls:
+            return page_tracks
+
+        with ThreadPoolExecutor(max_workers=max(2, len(self.base_urls))) as ex:
+            futures = {ex.submit(try_mirror, base): base for base in self.base_urls}
+            for future in as_completed(futures):
+                try:
+                    mirror_tracks = future.result()
+                    for tid, track in mirror_tracks.items():
+                        if tid not in page_tracks:
+                            page_tracks[tid] = track
+                except Exception:
+                    continue
+        return page_tracks
 
     def search_paginated(self, query: str, limit: int = 50, max_pages: int = 5) -> list[TrackMatch]:
         all_tracks: list[TrackMatch] = []
         seen_ids: set[int] = set()
         for page in range(max_pages):
             offset = page * limit
-            # Query all mirrors in parallel and merge results for maximum coverage
-            page_tracks: dict[int, TrackMatch] = {}
-            for base in self.base_urls:
-                try:
-                    resp = self.session.get(
-                        f"{base}/search/?s={quote(query)}&limit={limit}&offset={offset}",
-                        timeout=15,
-                    )
-                    if not resp.ok:
-                        continue
-                    data = resp.json()
-                    items = data.get("data", {}).get("items", [])
-                    if not isinstance(items, list):
-                        continue
-                    for item in items:
-                        tid = item["id"]
-                        if tid in seen_ids or tid in page_tracks:
-                            continue
-                        cover = item.get("album", {}).get("cover") or item.get("cover")
-                        album_art = None
-                        if isinstance(cover, str) and cover:
-                            album_art = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/320x320.jpg"
-                        page_tracks[tid] = TrackMatch(
-                            tidal_id=tid,
-                            title=item.get("title", "Unknown"),
-                            artists=[a.get("name", "Unknown") for a in item.get("artists", [])]
-                            or ([item.get("artist", {}).get("name")] if item.get("artist", {}).get("name") else []),
-                            album=item.get("album", {}).get("title", "Unknown"),
-                            duration_sec=item.get("duration", 0),
-                            quality=item.get("audioQuality", "UNKNOWN"),
-                            isrc=item.get("isrc") if isinstance(item.get("isrc"), str) else None,
-                            album_art_url=album_art,
-                            album_type=item.get("album", {}).get("type"),
-                            album_id=item.get("album", {}).get("id"),
-                        )
-                except Exception:
-                    continue
+            page_tracks = self._fetch_search_page(query, limit, offset)
             if not page_tracks:
                 break
             all_tracks.extend(page_tracks.values())
@@ -494,19 +519,19 @@ class MonochromeClient:
                 albums[key] = AlbumMatch(title=t.album, artists=t.artists, tracks=[])
             albums[key].tracks.append(t)
 
-        # Fetch full track listings via /album endpoint for accurate counts
+        # Fetch full track listings in parallel for every album that has an id.
+        resolved = self._resolve_albums_full_tracks(albums)
         full_albums: list[AlbumMatch] = []
-        for album in albums.values():
-            album_id = album.tracks[0].album_id if album.tracks else None
-            if album_id:
-                try:
-                    full_tracks, album_type, album_artists = self.get_album_tracks(album_id)
-                    if full_tracks:
-                        artists = album_artists if album_artists else album.artists
-                        full_albums.append(AlbumMatch(title=album.title, artists=artists, tracks=full_tracks, album_type=album_type))
-                        continue
-                except Exception as exc:
-                    console.print(f"[yellow][album] Failed to fetch full tracks for '{album.title}': {exc}[/yellow]")
+        for key, album in albums.items():
+            value = resolved.get(key)
+            if isinstance(value, tuple):
+                full_tracks, album_type, album_artists = value
+                if full_tracks:
+                    artists = album_artists if album_artists else album.artists
+                    full_albums.append(AlbumMatch(title=album.title, artists=artists, tracks=full_tracks, album_type=album_type))
+                    continue
+            elif isinstance(value, BaseException):
+                console.print(f"[yellow][album] Failed to fetch full tracks for '{album.title}': {value}[/yellow]")
             full_albums.append(album)
         return full_albums
 
@@ -525,26 +550,46 @@ class MonochromeClient:
             item = it.get("item", {}) if isinstance(it, dict) else {}
             if not item:
                 continue
-            cover = item.get("album", {}).get("cover") or item.get("cover")
-            album_art = None
-            if isinstance(cover, str) and cover:
-                album_art = f"https://resources.tidal.com/images/{cover.replace('-', '/')}/320x320.jpg"
-            results.append(
-                TrackMatch(
-                    tidal_id=item["id"],
-                    title=item.get("title", "Unknown"),
-                    artists=[a.get("name", "Unknown") for a in item.get("artists", [])]
-                    or ([item.get("artist", {}).get("name")] if item.get("artist", {}).get("name") else []),
-                    album=item.get("album", {}).get("title", "Unknown"),
-                    duration_sec=item.get("duration", 0),
-                    quality=item.get("audioQuality", "UNKNOWN"),
-                    isrc=item.get("isrc") if isinstance(item.get("isrc"), str) else None,
-                    album_art_url=album_art,
-                    album_type=item.get("album", {}).get("type"),
-                    album_id=item.get("album", {}).get("id"),
-                )
-            )
+            track = self._parse_track_item(item)
+            if track is not None:
+                results.append(track)
         return results, album_type, album_artists
+
+    def _resolve_albums_full_tracks(
+        self, albums: dict[str, AlbumMatch]
+    ) -> dict[str, tuple[list[TrackMatch], str | None, list[str]] | BaseException]:
+        """Fetch full track listings for many albums in parallel.
+
+        Returns a dict mapping each album key to either a
+        (tracks, album_type, album_artists) tuple or the exception raised.
+        """
+        results: dict[str, tuple[list[TrackMatch], str | None, list[str]] | BaseException] = {}
+        if not albums:
+            return results
+
+        album_ids: list[tuple[str, int]] = []
+        for key, album in albums.items():
+            album_id = album.tracks[0].album_id if album.tracks else None
+            if album_id is None:
+                results[key] = Exception("No album id")
+            else:
+                album_ids.append((key, album_id))
+
+        def fetch(key_id: tuple[str, int]) -> tuple[str, tuple[list[TrackMatch], str | None, list[str]]]:
+            key, album_id = key_id
+            return key, self.get_album_tracks(album_id)
+
+        total = len(album_ids)
+        with ThreadPoolExecutor(max_workers=max(2, min(ALBUM_FETCH_WORKERS, total))) as ex:
+            futures = {ex.submit(fetch, ki): ki[0] for ki in album_ids}
+            for future in as_completed(futures):
+                key = futures[future]
+                try:
+                    returned_key, value = future.result()
+                    results[returned_key] = value
+                except Exception as exc:
+                    results[key] = exc
+        return results
 
     def search_discography(self, artist: str, limit: int = 50, max_pages: int = 5, strict: bool = True) -> list[AlbumMatch]:
         tracks = self.search_paginated(artist, limit=limit, max_pages=max_pages)
@@ -563,25 +608,26 @@ class MonochromeClient:
                 albums[key] = AlbumMatch(title=t.album, artists=t.artists, tracks=[])
             albums[key].tracks.append(t)
 
-        # Fetch full track listings via /album endpoint for accurate counts
+        # Fetch full track listings in parallel for every album that has an id.
+        resolved = self._resolve_albums_full_tracks(albums)
         full_albums: list[AlbumMatch] = []
-        for album in albums.values():
+        for key, album in albums.items():
+            value = resolved.get(key)
             album_id = album.tracks[0].album_id if album.tracks else None
-            if album_id:
-                try:
-                    full_tracks, album_type, album_artists = self.get_album_tracks(album_id)
-                    if full_tracks:
-                        artists = album_artists if album_artists else album.artists
-                        # If album's primary artist doesn't match the searched artist,
-                        # it's a compilation/VA album — keep only tracks where the artist appears
-                        if strict and not artist_matches(artist, artists):
-                            full_tracks = [t for t in full_tracks if artist_matches(artist, t.artists)]
-                            if not full_tracks:
-                                continue
-                        full_albums.append(AlbumMatch(title=album.title, artists=artists, tracks=full_tracks, album_type=album_type))
-                        continue
-                except Exception as exc:
-                    console.print(f"[yellow][album] Failed to fetch full tracks for '{album.title}': {exc}[/yellow]")
+            if isinstance(value, tuple):
+                full_tracks, album_type, album_artists = value
+                if full_tracks:
+                    artists = album_artists if album_artists else album.artists
+                    # If album's primary artist doesn't match the searched artist,
+                    # it's a compilation/VA album — keep only tracks where the artist appears
+                    if strict and not artist_matches(artist, artists):
+                        full_tracks = [t for t in full_tracks if artist_matches(artist, t.artists)]
+                        if not full_tracks:
+                            continue
+                    full_albums.append(AlbumMatch(title=album.title, artists=artists, tracks=full_tracks, album_type=album_type))
+                    continue
+            elif isinstance(value, BaseException):
+                console.print(f"[yellow][album] Failed to fetch full tracks for '{album.title}': {value}[/yellow]")
             full_albums.append(album)
 
         console.print(f"[dim][discography] Grouped into {len(full_albums)} album(s)[/dim]")
@@ -1098,6 +1144,40 @@ def _note(log: list[str] | None, message: str) -> None:
         log.append(message)
 
 
+def _prefetch_stream_urls(
+    client: MonochromeClient,
+    tracks: list[TrackMatch],
+    status_log: list[str] | None = None,
+) -> dict[int, str | BaseException]:
+    """Resolve stream URLs for many tracks in parallel.
+
+    Returns a dict mapping tidal_id to either a playable URL string or the
+    exception that was raised while resolving it.
+    """
+    results: dict[int, str | BaseException] = {}
+    if not tracks:
+        return results
+
+    def resolve(track: TrackMatch) -> tuple[int, str | BaseException]:
+        try:
+            url = client.get_stream_url(track.tidal_id, quality=client.quality, isrc=track.isrc)
+            return track.tidal_id, url
+        except Exception as exc:
+            return track.tidal_id, exc
+
+    total = len(tracks)
+    with ThreadPoolExecutor(max_workers=max(2, min(STREAM_PREFETCH_WORKERS, total))) as ex:
+        futures = {ex.submit(resolve, t): t.tidal_id for t in tracks}
+        for future in as_completed(futures):
+            tid = futures[future]
+            try:
+                returned_tid, value = future.result()
+                results[returned_tid] = value
+            except Exception as exc:
+                results[tid] = exc
+    return results
+
+
 def download_single(
     client: MonochromeClient,
     track: TrackMatch,
@@ -1105,12 +1185,20 @@ def download_single(
     progress: Progress,
     task_id: int,
     status_log: list[str] | None = None,
+    prefetched_stream_url: str | None = None,
+    prefetched_error: BaseException | None = None,
 ) -> str:
-    try:
-        stream_url = client.get_stream_url(track.tidal_id, quality=client.quality, isrc=track.isrc)
-    except Exception as exc:
-        _note(status_log, f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
+    if prefetched_stream_url is not None:
+        stream_url = prefetched_stream_url
+    elif prefetched_error is not None:
+        _note(status_log, f"[red][skip] {track.title}: failed to get stream URL: {prefetched_error}[/red]")
         return "failed"
+    else:
+        try:
+            stream_url = client.get_stream_url(track.tidal_id, quality=client.quality, isrc=track.isrc)
+        except Exception as exc:
+            _note(status_log, f"[red][skip] {track.title}: failed to get stream URL: {exc}[/red]")
+            return "failed"
 
     raw_name = f"{', '.join(track.artists)} - {track.title}"
     safe_name = sanitize_filename(raw_name)
@@ -1214,6 +1302,15 @@ def download_album(
     total = len(album.tracks)
     downloaded = skipped = failed = 0
     notes: list[str] = []
+
+    # Resolve stream URLs for the whole album in parallel so the per-track
+    # loop only does the byte download. Per-album scope keeps URLs fresh.
+    with console.status(
+        f"[bold cyan]Resolving {total} stream URL(s) for {album.title}…",
+        spinner="dots",
+    ):
+        prefetched = _prefetch_stream_urls(client, album.tracks, status_log=notes)
+
     overall_progress = Progress(
         TextColumn("[bold cyan]Overall [/bold cyan]"),
         BarColumn(bar_width=24),
@@ -1249,9 +1346,31 @@ def download_album(
                     description=f"[{idx}/{total}] {track.title}",
                     total=None,
                 )
-                status = download_single(
-                    client, track, out, track_progress, track_task, status_log=notes
-                )
+                resolved = prefetched.get(track.tidal_id)
+                if isinstance(resolved, str):
+                    status = download_single(
+                        client,
+                        track,
+                        out,
+                        track_progress,
+                        track_task,
+                        status_log=notes,
+                        prefetched_stream_url=resolved,
+                    )
+                elif isinstance(resolved, BaseException):
+                    status = download_single(
+                        client,
+                        track,
+                        out,
+                        track_progress,
+                        track_task,
+                        status_log=notes,
+                        prefetched_error=resolved,
+                    )
+                else:
+                    status = download_single(
+                        client, track, out, track_progress, track_task, status_log=notes
+                    )
                 if status == "downloaded":
                     downloaded += 1
                     track_progress.update(
@@ -1642,7 +1761,8 @@ def _main() -> int:
     if args.discography:
         console.print(f"[bold]Searching discography for: {query}[/bold]")
         try:
-            albums = client.search_discography(query, limit=args.limit, max_pages=args.pages, strict=not args.no_strict)
+            with console.status("[bold cyan]Searching discography…", spinner="dots"):
+                albums = client.search_discography(query, limit=args.limit, max_pages=args.pages, strict=not args.no_strict)
         except Exception as exc:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
@@ -1655,7 +1775,8 @@ def _main() -> int:
     elif args.album:
         console.print(f"[bold]Searching albums for: {query}[/bold]")
         try:
-            albums = client.search_albums(query, limit=args.limit)
+            with console.status("[bold cyan]Searching albums…", spinner="dots"):
+                albums = client.search_albums(query, limit=args.limit)
         except Exception as exc:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
@@ -1667,7 +1788,8 @@ def _main() -> int:
     else:
         console.print(f"[bold]Searching tracks for: {query}[/bold]")
         try:
-            tracks, _ = client.search(query, limit=args.limit)
+            with console.status("[bold cyan]Searching tracks…", spinner="dots"):
+                tracks, _ = client.search(query, limit=args.limit)
         except Exception as exc:
             console.print(f"[red]Search failed: {exc}[/red]")
             return 1
